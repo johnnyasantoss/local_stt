@@ -7,6 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from src.audio import load_audio, get_audio_info, detect_format
 from src.logging import setup_logging, add_verbose_arg
 
@@ -61,7 +63,8 @@ def main() -> int:
                 tmp_path.rename(output_path)
                 print(str(output_path))
             else:
-                sys.stdout.write(str(tmp_path.read_bytes()))
+                # For stdout, just print the temp path
+                print(str(tmp_path))
 
         logger.info("Done")
         return 0

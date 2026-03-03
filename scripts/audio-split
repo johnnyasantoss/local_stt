@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Split audio into chunks by size with overlap."""
+
+import argparse
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from pydub import AudioSegment
+
+from src.audio import load_audio, get_audio_info
+from src.logging import setup_logging, add_verbose_arg
+
+
+def calculate_chunk_duration(
+    target_size_mb: float,
+    bitrate: int = 128000,
+) -> int:
+    """Calculate chunk duration for target file size."""
+    target_bytes = target_size_mb * 1024 * 1024
+    bytes_per_second = bitrate / 8
+    return int(target_bytes / bytes_per_second)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Split audio into chunks by size")
+    add_verbose_arg(parser)
+    parser.add_argument("-i", "--input", type=Path, required=True, help="Input audio file")
+    parser.add_argument("-o", "--output", type=Path, required=True, help="Output directory")
+    parser.add_argument("--size-mb", type=float, default=10, help="Max size per chunk in MiB (default: 10)")
+    parser.add_argument("--overlap", type=int, default=5, help="Overlap in seconds (default: 5)")
+    parser.add_argument("--format", default="ogg", help="Output format (default: ogg)")
+    parser.add_argument("--codec", default="libopus", help="Audio codec (default: libopus)")
+    parser.add_argument("--bitrate", default="128000", help="Bitrate (default: 128000)")
+
+    args = parser.parse_args()
+    logger = setup_logging(args.v)
+
+    try:
+        input_path = args.input
+        logger.info(f"Loading: {input_path}")
+
+        audio = load_audio(input_path)
+        info = get_audio_info(audio)
+        logger.info(f"Audio: {info['duration_seconds']:.1f}s")
+
+        output_dir = args.output
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        chunk_duration_s = calculate_chunk_duration(args.size_mb, int(args.bitrate))
+        chunk_duration_ms = chunk_duration_s * 1000
+        overlap_ms = args.overlap * 1000
+
+        total_ms = len(audio)
+        step_ms = chunk_duration_ms - overlap_ms
+
+        if step_ms <= 0:
+            logger.warning(f"Overlap ({args.overlap}s) >= chunk duration ({chunk_duration_s}s), using 0 overlap")
+            step_ms = chunk_duration_ms
+            overlap_ms = 0
+
+        num_chunks = max(1, (total_ms - overlap_ms) // step_ms + (1 if total_ms % step_ms > overlap_ms else 0))
+        logger.info(f"Splitting into ~{num_chunks} chunks ({args.size_mb}MiB each, {args.overlap}s overlap)")
+
+        base_name = input_path.stem
+        chunks = []
+        chunk_num = 1
+        pos_ms = 0
+
+        while pos_ms < total_ms:
+            start = pos_ms
+            end = min(pos_ms + chunk_duration_ms, total_ms)
+            chunk = audio[start:end]
+
+            output_path = output_dir / f"{base_name}_{chunk_num:03d}.{args.format}"
+            chunk.export(
+                str(output_path),
+                format=args.format,
+                codec=args.codec,
+                bitrate=args.bitrate,
+            )
+
+            size_mb = output_path.stat().st_size / (1024 * 1024)
+            logger.info(f"  Created: {output_path.name} ({len(chunk)/1000:.1f}s, {size_mb:.2f}MB)")
+
+            chunks.append(output_path)
+            chunk_num += 1
+            pos_ms += step_ms
+
+            if pos_ms >= total_ms:
+                break
+
+        logger.info(f"Split complete: {len(chunks)} chunks")
+        print("\n".join(str(p) for p in chunks))
+        return 0
+
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

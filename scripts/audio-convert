@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Convert audio to 16kHz mono Opus (.ogg)."""
+
+import argparse
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from pydub import AudioSegment
+
+from src.audio import load_audio, get_audio_info
+from src.logging import setup_logging, add_verbose_arg
+
+
+def convert_audio(
+    input_path: Path,
+    output_path: Path,
+    sample_rate: int = 16000,
+    channels: int = 1,
+    format: str = "ogg",
+    codec: str = "libopus",
+    bitrate: str = "128000",
+    logger=None,
+) -> None:
+    """Convert audio to target format, sample rate, and channels."""
+    audio = load_audio(input_path)
+
+    if audio.channels != channels:
+        audio = audio.set_channels(channels)
+        if logger:
+            logger.info(f"Converted to {channels} channel(s)")
+
+    if audio.frame_rate != sample_rate:
+        audio = audio.set_frame_rate(sample_rate)
+        if logger:
+            logger.info(f"Resampled to {sample_rate}Hz")
+
+    audio.export(
+        str(output_path),
+        format=format,
+        codec=codec,
+        bitrate=bitrate,
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Convert audio to 16kHz mono Opus")
+    add_verbose_arg(parser)
+    parser.add_argument("-i", "--input", type=Path, required=True, help="Input audio file")
+    parser.add_argument("-o", "--output", type=Path, help="Output file")
+    parser.add_argument("--sample-rate", type=int, default=16000, help="Target sample rate (default: 16000)")
+    parser.add_argument("--channels", type=int, default=1, help="Target channels (default: 1 = mono)")
+    parser.add_argument("--format", default="ogg", help="Output format (default: ogg)")
+    parser.add_argument("--codec", default="libopus", help="Audio codec (default: libopus)")
+    parser.add_argument("--bitrate", default="128000", help="Bitrate (default: 128000)")
+
+    args = parser.parse_args()
+    logger = setup_logging(args.v)
+
+    try:
+        input_path = args.input
+        logger.info(f"Loading: {input_path}")
+
+        audio = load_audio(input_path)
+        info = get_audio_info(audio)
+        logger.info(f"Audio: {info['duration_seconds']:.1f}s, {info['channels']}ch, {info['sample_rate']}Hz")
+
+        if args.output:
+            output_path = args.output
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            tmpdir = tempfile.mkdtemp()
+            stem = input_path.stem
+            output_path = Path(tmpdir) / f"{stem}.{args.format}"
+
+        logger.info(f"Converting to {args.sample_rate}Hz, {args.channels}ch, {args.codec}...")
+        convert_audio(
+            input_path,
+            output_path,
+            args.sample_rate,
+            args.channels,
+            args.format,
+            args.codec,
+            args.bitrate,
+            logger,
+        )
+
+        size_mb = output_path.stat().st_size / (1024 * 1024)
+        logger.info(f"Output: {output_path} ({size_mb:.2f}MB)")
+        print(str(output_path))
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
