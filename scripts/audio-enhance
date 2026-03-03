@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Audio voice enhancement with high-pass and low-pass filters."""
+
+import argparse
+import sys
+from pathlib import Path
+
+from pydub import AudioSegment
+from pydub.effects import high_pass_filter, low_pass_filter
+
+from src.audio import load_audio, get_audio_info
+from src.logging import setup_logging, add_verbose_arg
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Apply voice enhancement filters")
+    add_verbose_arg(parser)
+    parser.add_argument("-i", "--input", type=Path, required=True, help="Input audio file")
+    parser.add_argument("-o", "--output", type=Path, help="Output file (default: stdout)")
+    parser.add_argument("--high-pass", type=int, default=80, help="High-pass Hz (default: 80)")
+    parser.add_argument("--low-pass", type=int, default=8000, help="Low-pass Hz (default: 8000)")
+    parser.add_argument("--format", default="wav", help="Output format (default: wav)")
+
+    args = parser.parse_args()
+    logger = setup_logging(args.v)
+
+    try:
+        input_path = args.input
+        logger.info(f"Loading: {input_path}")
+
+        audio = load_audio(input_path)
+        info = get_audio_info(audio)
+        logger.info(f"Audio: {info['duration_seconds']:.1f}s, {info['channels']}ch, {info['sample_rate']}Hz")
+
+        logger.info(f"Applying filters: high-pass {args.high_pass}Hz, low-pass {args.low_pass}Hz")
+        audio = high_pass_filter(audio, args.high_pass)
+        audio = low_pass_filter(audio, args.low_pass)
+        logger.info("Enhancement complete")
+
+        output_path = args.output
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            audio.export(str(output_path), format=args.format)
+            print(str(output_path))
+        else:
+            # Export to temp and print path
+            with tempfile.NamedTemporaryFile(suffix=f".{args.format}", delete=False) as f:
+                tmp_path = f.name
+            audio.export(tmp_path, format=args.format)
+            print(tmp_path)
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    import tempfile
+    sys.exit(main())
