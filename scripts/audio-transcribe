@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.config import require_env
+from src.config import load_env, require_env
 from src.logging import add_verbose_arg, setup_logging
 from src.transcribe import (
     MAX_FILE_SIZE_MB,
@@ -32,6 +32,8 @@ def main() -> int:
                         help="Language code (e.g., en)")
     parser.add_argument("-j", "--parallel", type=int, default=4,
                         help="Parallel API calls (default: 4)")
+    parser.add_argument("--fail-fast", action="store_true",
+                        help="Stop on first error")
     parser.add_argument("--overlap-secs", type=float, default=5.0,
                         help="Overlap seconds used when splitting (default: 5)")
     parser.add_argument("--chunk-duration", type=float, default=600.0,
@@ -40,6 +42,7 @@ def main() -> int:
     args = parser.parse_args()
     logger = setup_logging(args.v)
     
+    load_env()
     require_env("GROQ_API_KEY")
     
     input_path = args.input
@@ -57,6 +60,7 @@ def main() -> int:
             return 1
     
     try:
+        fail_fast = args.fail_fast or args.parallel == 1
         output_path = transcribe_audio(
             input_path=input_path,
             output_path=args.output,
@@ -66,6 +70,7 @@ def main() -> int:
             overlap_secs=args.overlap_secs,
             chunk_duration=args.chunk_duration,
             logger=logger,
+            fail_fast=fail_fast,
         )
         print(str(output_path))
         return 0

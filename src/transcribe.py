@@ -101,14 +101,23 @@ def transcribe_chunk(
 
         segments = []
         if hasattr(response, "segments") and response.segments:
-            segments = [
-                {
-                    "start": seg.start,
-                    "end": seg.end,
-                    "text": seg.text,
-                }
-                for seg in response.segments
-            ]
+            for seg in response.segments:
+                if isinstance(seg, dict):
+                    segments.append(
+                        {
+                            "start": seg.get("start", 0.0),
+                            "end": seg.get("end", 0.0),
+                            "text": seg.get("text", ""),
+                        }
+                    )
+                else:
+                    segments.append(
+                        {
+                            "start": seg.start,
+                            "end": seg.end,
+                            "text": seg.text,
+                        }
+                    )
 
         result_data = {
             "chunk": str(chunk_path),
@@ -227,6 +236,7 @@ def transcribe_audio(
     overlap_secs: float = 5.0,
     chunk_duration: float = 600.0,
     logger: logging.Logger | None = None,
+    fail_fast: bool = False,
 ) -> Path:
     """Transcribe audio file or directory of chunks.
 
@@ -239,6 +249,7 @@ def transcribe_audio(
         overlap_secs: Overlap seconds used when splitting
         chunk_duration: Expected chunk duration in seconds
         logger: Optional logger instance
+        fail_fast: Stop on first error
 
     Returns:
         Path to output SRT file
@@ -261,6 +272,7 @@ def transcribe_audio(
             overlap_secs,
             chunk_duration,
             logger,
+            fail_fast,
         )
     else:
         raise TranscriptionError(f"Input not found: {input_path}")
@@ -319,6 +331,7 @@ def _transcribe_directory(
     overlap_secs: float,
     chunk_duration: float,
     logger: logging.Logger,
+    fail_fast: bool = False,
 ) -> Path:
     """Transcribe a directory of audio chunks."""
     audio_files = get_audio_files_from_dir(input_dir)
@@ -333,6 +346,7 @@ def _transcribe_directory(
         logger.info(f"Resuming: found {len(existing)} existing transcripts")
 
     results: list[ChunkResult] = []
+    failed = False
 
     with ThreadPoolExecutor(max_workers=parallel) as executor:
         futures = {
@@ -350,9 +364,18 @@ def _transcribe_directory(
                     logger.debug(f"Transcribed: {chunk_path.name}")
                 else:
                     logger.warning(f"Failed: {chunk_path.name} - {result.error}")
+                    if fail_fast:
+                        failed = True
+                        break
 
             except Exception as e:
                 logger.error(f"Error processing {chunk_path.name}: {e}")
+                if fail_fast:
+                    failed = True
+                    break
+
+    if fail_fast and failed:
+        raise TranscriptionError("Transcription failed for one or more chunks")
 
     results.sort(key=lambda x: x.chunk_path.name)
 
