@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Full audio processing pipeline: normalize -> enhance -> convert -> split."""
+
+import argparse
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.logging import setup_logging, add_verbose_arg
+
+
+def run_script(script: str, args: list, logger) -> subprocess.CompletedProcess:
+    """Run a script and return the result."""
+    cmd = ["python", f"scripts/{script}"] + args
+    logger.debug(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Full audio processing pipeline: normalize -> enhance -> convert -> split"
+    )
+    add_verbose_arg(parser)
+    parser.add_argument("-i", "--input", type=Path, required=True, help="Input audio file")
+    parser.add_argument("-o", "--output", type=Path, required=True, help="Output directory")
+    parser.add_argument("--keep-temp", action="store_true", help="Keep temporary files")
+    parser.add_argument("--overlap", type=int, default=5, help="Chunk overlap seconds (default: 5)")
+    parser.add_argument("--size-mb", type=float, default=10, help="Max chunk size MiB (default: 10)")
+
+    args = parser.parse_args()
+    logger = setup_logging(args.v)
+
+    try:
+        input_path = args.input.resolve()
+        output_dir = args.output.resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info("=" * 50)
+        logger.info("Starting audio processing pipeline")
+        logger.info("=" * 50)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+
+            # Stage 1: Normalize
+            logger.info("[1/4] Normalizing loudness...")
+            norm_out = tmp / "normalized.wav"
+            result = run_script(
+                "audio-normalize",
+                ["-i", str(input_path), "-o", str(norm_out), "-v" * args.v],
+                logger,
+            )
+            if result.returncode != 0:
+                logger.error(f"normalize failed: {result.stderr}")
+                return 1
+            logger.info(f"  -> {norm_out}")
+
+            # Stage 2: Enhance
+            logger.info("[2/4] Enhancing voice...")
+            enh_out = tmp / "enhanced.wav"
+            result = run_script(
+                "audio-enhance",
+                ["-i", str(norm_out), "-o", str(enh_out), "-v" * args.v],
+                logger,
+            )
+            if result.returncode != 0:
+                logger.error(f"enhance failed: {result.stderr}")
+                return 1
+            logger.info(f"  -> {enh_out}")
+
+            # Stage 3: Convert
+            logger.info("[3/4] Converting to 16kHz mono Opus...")
+            conv_out = output_dir / "processed.ogg"
+            result = run_script(
+                "audio-convert",
+                ["-i", str(enh_out), "-o", str(conv_out), "-v" * args.v],
+                logger,
+            )
+            if result.returncode != 0:
+                logger.error(f"convert failed: {result.stderr}")
+                return 1
+            logger.info(f"  -> {conv_out}")
+
+            # Stage 4: Split
+            logger.info("[4/4] Splitting by size...")
+            split_dir = output_dir / "chunks"
+            result = run_script(
+                "audio-split",
+                ["-i", str(conv_out), "-o", str(split_dir), "--size-mb", str(args.size_mb),
+                 "--overlap", str(args.overlap), "-v" * args.v],
+                logger,
+            )
+            if result.returncode != 0:
+                logger.error(f"split failed: {result.stderr}")
+                return 1
+
+            chunk_files = [Path(p) for p in result.stdout.strip().split("\n") if p]
+            logger.info(f"  -> Created {len(chunk_files)} chunks in {split_dir}")
+
+        logger.info("=" * 50)
+        logger.info("Pipeline complete!")
+        logger.info(f"  Output: {output_dir}")
+        logger.info(f"  Chunks: {len(chunk_files)}")
+
+        if args.keep_temp:
+            logger.info(f"  Temp: {conv_out}")
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
