@@ -29,7 +29,7 @@ def normalize_loudness(
         "-y",
         str(output_path),
     ]
-    subprocess.run(cmd, check=True, logger=logger)
+    subprocess.run(cmd, check=True)
 
 
 def main() -> int:
