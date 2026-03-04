@@ -2,16 +2,16 @@
 """Convert audio to 16kHz mono Opus (.ogg)."""
 
 import argparse
+import os
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pydub import AudioSegment
 
-from src.audio import load_audio, get_audio_info
-from src.logging import setup_logging, add_verbose_arg
+from src.audio import get_audio_info, load_audio
+from src.config import resolve_output_path
+from src.logging import add_verbose_arg, setup_logging
 
 
 def convert_audio(
@@ -22,6 +22,7 @@ def convert_audio(
     format: str = "ogg",
     codec: str = "libopus",
     bitrate: str = "128000",
+    threads: int = 0,
     logger=None,
 ) -> None:
     """Convert audio to target format, sample rate, and channels."""
@@ -37,11 +38,14 @@ def convert_audio(
         if logger:
             logger.info(f"Resampled to {sample_rate}Hz")
 
+    thread_count = threads or os.cpu_count() or 1
+    ffmpeg_params = ["-threads", str(thread_count)]
     audio.export(
         str(output_path),
         format=format,
         codec=codec,
         bitrate=bitrate,
+        parameters=ffmpeg_params,
     )
 
 
@@ -55,6 +59,10 @@ def main() -> int:
     parser.add_argument("--format", default="ogg", help="Output format (default: ogg)")
     parser.add_argument("--codec", default="libopus", help="Audio codec (default: libopus)")
     parser.add_argument("--bitrate", default="128000", help="Bitrate (default: 128000)")
+    parser.add_argument(
+        "-j", "--threads", type=int, default=0,
+        help="Number of threads (0 = all cores, default: 0)"
+    )
 
     args = parser.parse_args()
     logger = setup_logging(args.v)
@@ -67,15 +75,10 @@ def main() -> int:
         info = get_audio_info(audio)
         logger.info(f"Audio: {info['duration_seconds']:.1f}s, {info['channels']}ch, {info['sample_rate']}Hz")
 
-        if args.output:
-            output_path = args.output
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            tmpdir = tempfile.mkdtemp()
-            stem = input_path.stem
-            output_path = Path(tmpdir) / f"{stem}.{args.format}"
+        output_path = resolve_output_path(args.output, input_path, args.format)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"Converting to {args.sample_rate}Hz, {args.channels}ch, {args.codec}...")
+        logger.info(f"Converting to {args.sample_rate}Hz, {args.channels}ch, {args.codec} (threads: {args.threads or 'all'})...")
         convert_audio(
             input_path,
             output_path,
@@ -84,6 +87,7 @@ def main() -> int:
             args.format,
             args.codec,
             args.bitrate,
+            args.threads,
             logger,
         )
 

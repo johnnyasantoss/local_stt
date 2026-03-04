@@ -2,21 +2,28 @@
 """Audio loudness normalization using EBU R128."""
 
 import argparse
+import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.audio import load_audio, get_audio_info, detect_format
-from src.logging import setup_logging, add_verbose_arg
+from src.audio import get_audio_info, load_audio
+from src.config import resolve_output_path
+from src.logging import add_verbose_arg, setup_logging
+
+
+def get_default_threads() -> int:
+    """Return default thread count (0 = all cores)."""
+    return 0
 
 
 def normalize_loudness(
     input_path: Path,
     output_path: Path,
     target_lufs: float = -16.0,
+    threads: int = 0,
     logger=None,
 ) -> None:
     """Apply EBU R128 loudness normalization using ffmpeg."""
@@ -24,6 +31,7 @@ def normalize_loudness(
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "warning",
+        "-threads", str(threads) if threads > 0 else str(os.cpu_count() or 1),
         "-i", str(input_path),
         "-af", f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11",
         "-y",
@@ -40,6 +48,10 @@ def main() -> int:
     parser.add_argument(
         "--target-lufs", type=float, default=-16.0, help="Target loudness in LUFS (default: -16)"
     )
+    parser.add_argument(
+        "-j", "--threads", type=int, default=0,
+        help="Number of threads (0 = all cores, default: 0)"
+    )
 
     args = parser.parse_args()
     logger = setup_logging(args.v)
@@ -52,21 +64,14 @@ def main() -> int:
         info = get_audio_info(audio)
         logger.info(f"Audio: {info['duration_seconds']:.1f}s, {info['channels']}ch, {info['sample_rate']}Hz")
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir) / "normalized.wav"
-            logger.info(f"Normalizing to {args.target_lufs} LUFS...")
-            normalize_loudness(input_path, tmp_path, args.target_lufs, logger)
+        output_path = resolve_output_path(args.output, input_path, "wav")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
-            if args.output:
-                output_path = args.output
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_path.rename(output_path)
-                print(str(output_path))
-            else:
-                # For stdout, just print the temp path
-                print(str(tmp_path))
+        logger.info(f"Normalizing to {args.target_lufs} LUFS (threads: {args.threads or 'all'})...")
+        normalize_loudness(input_path, output_path, args.target_lufs, args.threads, logger)
 
-        logger.info("Done")
+        logger.info(f"Done: {output_path}")
+        print(str(output_path))
         return 0
 
     except FileNotFoundError as e:

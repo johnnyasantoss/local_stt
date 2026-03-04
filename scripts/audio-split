@@ -2,6 +2,7 @@
 """Split audio into chunks by size with overlap."""
 
 import argparse
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -34,6 +35,10 @@ def main() -> int:
     parser.add_argument("--format", default="ogg", help="Output format (default: ogg)")
     parser.add_argument("--codec", default="libopus", help="Audio codec (default: libopus)")
     parser.add_argument("--bitrate", default="128000", help="Bitrate (default: 128000)")
+    parser.add_argument(
+        "-j", "--threads", type=int, default=0,
+        help="Number of threads (0 = all cores, default: 0)"
+    )
 
     args = parser.parse_args()
     logger = setup_logging(args.v)
@@ -62,7 +67,7 @@ def main() -> int:
             overlap_ms = 0
 
         num_chunks = max(1, (total_ms - overlap_ms) // step_ms + (1 if total_ms % step_ms > overlap_ms else 0))
-        logger.info(f"Splitting into ~{num_chunks} chunks ({args.size_mb}MiB each, {args.overlap}s overlap)")
+        logger.info(f"Splitting into ~{num_chunks} chunks ({args.size_mb}MiB each, {args.overlap}s overlap, threads: {args.threads or 'all'})")
 
         base_name = input_path.stem
         chunks = []
@@ -75,11 +80,14 @@ def main() -> int:
             chunk = audio[start:end]
 
             output_path = output_dir / f"{base_name}_{chunk_num:03d}.{args.format}"
+            threads = args.threads or os.cpu_count() or 1
+            ffmpeg_params = ["-threads", str(threads)]
             chunk.export(
                 str(output_path),
                 format=args.format,
                 codec=args.codec,
                 bitrate=args.bitrate,
+                parameters=ffmpeg_params,
             )
 
             size_mb = output_path.stat().st_size / (1024 * 1024)

@@ -2,17 +2,17 @@
 """Audio voice enhancement with high-pass and low-pass filters."""
 
 import argparse
+import os
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pydub import AudioSegment
 from pydub.effects import high_pass_filter, low_pass_filter
 
-from src.audio import load_audio, get_audio_info
-from src.logging import setup_logging, add_verbose_arg
+from src.audio import get_audio_info, load_audio
+from src.config import resolve_output_path
+from src.logging import add_verbose_arg, setup_logging
 
 
 def main() -> int:
@@ -23,6 +23,10 @@ def main() -> int:
     parser.add_argument("--high-pass", type=int, default=80, help="High-pass Hz (default: 80)")
     parser.add_argument("--low-pass", type=int, default=8000, help="Low-pass Hz (default: 8000)")
     parser.add_argument("--format", default="wav", help="Output format (default: wav)")
+    parser.add_argument(
+        "-j", "--threads", type=int, default=0,
+        help="Number of threads (0 = all cores, default: 0)"
+    )
 
     args = parser.parse_args()
     logger = setup_logging(args.v)
@@ -40,18 +44,15 @@ def main() -> int:
         audio = low_pass_filter(audio, args.low_pass)
         logger.info("Enhancement complete")
 
-        output_path = args.output
-        if output_path:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            audio.export(str(output_path), format=args.format)
-            print(str(output_path))
-        else:
-            # Export to temp and print path
-            with tempfile.NamedTemporaryFile(suffix=f".{args.format}", delete=False) as f:
-                tmp_path = f.name
-            audio.export(tmp_path, format=args.format)
-            print(tmp_path)
+        output_path = resolve_output_path(args.output, input_path, args.format)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        threads = args.threads or os.cpu_count() or 1
+        ffmpeg_params = ["-threads", str(threads)]
+        audio.export(str(output_path), format=args.format, parameters=ffmpeg_params)
+
+        logger.info(f"Done: {output_path}")
+        print(str(output_path))
         return 0
 
     except Exception as e:

@@ -12,8 +12,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.logging import setup_logging, add_verbose_arg
 
 
-def run_script(script: str, args: list, logger) -> subprocess.CompletedProcess:
+def run_script(script: str, args: list, logger, threads: int = 0) -> subprocess.CompletedProcess:
     """Run a script and return the result."""
+    if threads > 0:
+        args = ["-j", str(threads)] + args
     cmd = ["python", f"scripts/{script}"] + args
     logger.debug(f"Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -30,6 +32,10 @@ def main() -> int:
     parser.add_argument("--keep-temp", action="store_true", help="Keep temporary files")
     parser.add_argument("--overlap", type=int, default=5, help="Chunk overlap seconds (default: 5)")
     parser.add_argument("--size-mb", type=float, default=10, help="Max chunk size MiB (default: 10)")
+    parser.add_argument(
+        "-j", "--threads", type=int, default=0,
+        help="Number of threads (0 = all cores, default: 0)"
+    )
 
     args = parser.parse_args()
     logger = setup_logging(args.v)
@@ -53,6 +59,7 @@ def main() -> int:
                 "audio-normalize",
                 ["-i", str(input_path), "-o", str(norm_out), "-v" * args.v],
                 logger,
+                args.threads,
             )
             if result.returncode != 0:
                 logger.error(f"normalize failed: {result.stderr}")
@@ -66,6 +73,7 @@ def main() -> int:
                 "audio-enhance",
                 ["-i", str(norm_out), "-o", str(enh_out), "-v" * args.v],
                 logger,
+                args.threads,
             )
             if result.returncode != 0:
                 logger.error(f"enhance failed: {result.stderr}")
@@ -79,6 +87,7 @@ def main() -> int:
                 "audio-convert",
                 ["-i", str(enh_out), "-o", str(conv_out), "-v" * args.v],
                 logger,
+                args.threads,
             )
             if result.returncode != 0:
                 logger.error(f"convert failed: {result.stderr}")
@@ -93,6 +102,7 @@ def main() -> int:
                 ["-i", str(conv_out), "-o", str(split_dir), "--size-mb", str(args.size_mb),
                  "--overlap", str(args.overlap), "-v" * args.v],
                 logger,
+                args.threads,
             )
             if result.returncode != 0:
                 logger.error(f"split failed: {result.stderr}")

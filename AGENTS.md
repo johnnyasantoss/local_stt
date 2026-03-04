@@ -182,3 +182,7 @@ python scripts/audio-enhance -i /tmp/normalized.wav -o /tmp/enhanced.wav
 - Focus on "why", not "what"
 - Example: `feat: add audio-normalize script with EBU R128 support`
 - Always verify working before committing
+
+## Agent Rules
+- when finished, commit your work as atomic units (they build individually allowing git bisect)
+- NEVER read `.env` or secret files

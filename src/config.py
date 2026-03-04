@@ -2,6 +2,7 @@
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -21,7 +22,7 @@ def load_env(project_root: Path | None = None) -> None:
     if env_path.exists():
         load_dotenv(env_path)
     else:
-        load_dotenv(dotenv_path=False)
+        load_dotenv()
 
 
 def get_env(key: str, default: str | None = None) -> str | None:
@@ -52,3 +53,42 @@ def parse_output_dir(value: str) -> Path:
     path = Path(value)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def resolve_output_path(
+    output_arg: Path | None,
+    input_path: Path,
+    default_ext: str,
+    is_directory: bool = False,
+) -> Path:
+    """Resolve output path with smart extension handling.
+
+    - If output_arg is None: use input stem + default_ext in temp dir
+    - If is_directory=True: treat as directory, create if needed
+    - If path has extension: use as-is
+    - If no extension: append default_ext
+
+    Args:
+        output_arg: The output path from CLI argument
+        input_path: Input file path (for deriving default name)
+        default_ext: Default extension to append (e.g., "wav", "ogg")
+        is_directory: If True, treat as directory path
+
+    Returns:
+        Resolved output Path
+    """
+    if output_arg is None:
+        stem = input_path.stem
+        return Path(tempfile.gettempdir()) / f"{stem}_out.{default_ext}"
+
+    if is_directory:
+        output_arg = Path(output_arg)
+        output_arg.mkdir(parents=True, exist_ok=True)
+        return output_arg
+
+    output_arg = Path(output_arg)
+
+    if output_arg.suffix:
+        return output_arg
+
+    return output_arg.with_suffix(f".{default_ext}")
