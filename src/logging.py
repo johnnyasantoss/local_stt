@@ -3,7 +3,6 @@
 import argparse
 import logging
 import sys
-from typing import Optional
 
 
 def setup_logging(verbosity: int = 0) -> logging.Logger:

@@ -3,7 +3,6 @@
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -13,7 +12,7 @@ def get_project_root() -> Path:
     return Path(__file__).parent.parent
 
 
-def load_env(project_root: Optional[Path] = None) -> None:
+def load_env(project_root: Path | None = None) -> None:
     """Load .env file from project root."""
     if project_root is None:
         project_root = get_project_root()
@@ -25,7 +24,7 @@ def load_env(project_root: Optional[Path] = None) -> None:
         load_dotenv(dotenv_path=False)
 
 
-def get_env(key: str, default: Optional[str] = None) -> Optional[str]:
+def get_env(key: str, default: str | None = None) -> str | None:
     """Get environment variable value."""
     return os.getenv(key, default)
 

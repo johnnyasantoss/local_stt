@@ -1,10 +1,8 @@
 """Shared audio utilities."""
 
 from pathlib import Path
-from typing import Optional
 
 from pydub import AudioSegment
-
 
 SUPPORTED_EXTENSIONS: set[str] = {
     "flac",
