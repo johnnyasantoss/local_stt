@@ -1,7 +1,7 @@
 [project]
-name = "groq-stt"
+name = "local-sst"
 version = "0.1.0"
-description = "Audio preprocessing pipeline for Groq Speech-to-Text"
+description = "Offline speech-to-text pipeline with speaker diarization"
 requires-python = ">=3.11"
 dependencies = [
     "pydub",

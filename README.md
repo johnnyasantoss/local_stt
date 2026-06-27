@@ -1,172 +1,107 @@
-# groq-stt
+# local-sst
 
-Audio preprocessing and transcription pipeline for Groq Whisper API.
+Offline speech-to-text pipeline with speaker diarization. Transcribes audio locally using ONNX models from [Handy.app](https://handy.computer), with optional Groq cloud API.
 
 ## Features
 
-- **Loudness Normalization** - EBU R128 standard for consistent audio levels
-- **Voice Enhancement** - High-pass and low-pass filters to clean up audio
-- **Format Conversion** - Convert to 16kHz mono Opus (optimal for Whisper)
-- **Smart Chunking** - Split large files with overlap for accurate transcription
-- **Parallel Transcription** - Transcribe multiple chunks concurrently via Groq API
-- **SRT/VTT Output** - Generate subtitle files with timestamps
+- **Local ONNX transcription** — Parakeet TDT and Canary AED models, CPU-optimized (~28x real-time)
+- **Speaker diarization** — pyannote-audio with interactive speaker labeling and timestamps
+- **VAD segmentation** — Silero VAD with configurable speech duration
+- **Session resume** — Every stage cached (transcription, diarization, WAV, speaker labels)
+- **Audio preprocessing** — Loudness normalization, voice enhancement, format conversion, chunking
+- **SRT output** — Subtitle files with optional speaker prefixes (`Speaker Johnny: ...`)
+- **Groq API** — Optional cloud transcription via `--engine groq`
 
 ## Prerequisites
 
-- **ffmpeg** - Must be installed system-wide
-  ```bash
-  # macOS
-  brew install ffmpeg
-
-  # Ubuntu/Debian
-  sudo apt install ffmpeg
-
-  # Arch
-  sudo pacman -S ffmpeg
-  ```
-
+- **ffmpeg** (system)
 - **Python 3.11+**
-
-- **Groq API Key** - Get from https://console.groq.com/keys
+- **HF_TOKEN** — HuggingFace token for diarization (accept conditions at [pyannote/speaker-diarization-3.1](https://hf.co/pyannote/speaker-diarization-3.1) and [pyannote/segmentation-3.0](https://hf.co/pyannote/segmentation-3.0))
+- **GROQ_API_KEY** — Optional, only for `--engine groq`
 
 ## Installation
 
 ```bash
-# Create virtual environment
 uv venv
 source .venv/bin/activate
+uv pip install pydub python-dotenv "onnx-asr[cpu,hub]" pyannote-audio
 
-# Install dependencies
-uv pip install pydub python-dotenv
-
-# Copy environment template and add your API key
 cp .env.example .env
-# Edit .env and add: GROQ_API_KEY=your_key_here
+# Edit .env: add HF_TOKEN=hf_xxx (and GROQ_API_KEY if using cloud)
 ```
 
 ## Quick Start
 
-### Transcribe a 1-hour meeting
-
 ```bash
-# Single command does it all: normalize -> enhance -> convert -> split -> transcribe
-python scripts/audio-process -i recording.m4a -o output/
+# Full pipeline with local models
+python scripts/audio-process -i meeting.m4a -o output/ --engine local --model parakeet -vvv
+
+# Resume a failed run (skips completed stages)
+python scripts/audio-process -i meeting.m4a -o output/ --engine local -c -vvv
+
+# With speaker diarization (interactive, requires terminal)
+python scripts/audio-transcribe-local -i output/chunks -o output/transcription.srt \
+  --model parakeet --diarize -vvv
+
+# Cloud transcription via Groq
+python scripts/audio-process -i meeting.m4a -o output/ --engine groq -vvv
 ```
 
-This creates:
-- `output/processed.ogg` - Processed audio
-- `output/chunks/` - Split audio chunks
-- `output/chunks/*.srt` - Transcribed subtitles
+## Pipeline
 
-## Usage
+1. `audio-normalize` — EBU R128 loudness normalization
+2. `audio-enhance` — High-pass/low-pass voice filters (ffmpeg)
+3. `audio-convert` — Convert to 16kHz mono Opus
+4. `audio-split` — Split by size with overlap
+5. `audio-transcribe-local` (or `audio-transcribe` for Groq) — Transcribe chunks
+6. `diarize` — Optional speaker labeling via pyannote-audio
 
-### Individual Scripts
+Output: `transcription.srt` + `.speakers.json` + `.diarization.json` + `.diarize.wav` (all cached for re-runs)
 
-Each script is independent and follows Unix philosophy:
+## Individual Scripts
 
 ```bash
-# Normalize loudness (EBU R128)
 python scripts/audio-normalize -i input.m4a -o normalized.wav -vvv
-
-# Enhance voice (high/low pass filters)
 python scripts/audio-enhance -i normalized.wav -o enhanced.wav -vvv
-
-# Convert to 16kHz mono Opus
 python scripts/audio-convert -i enhanced.wav -o output.ogg -vvv
-
-# Split into chunks by size (default: 10MB chunks with 5s overlap)
 python scripts/audio-split -i output.ogg -o chunks/ --size-mb 10 --overlap 5 -vvv
-
-# Transcribe using Groq API
-python scripts/audio-transcribe -i chunks/ -o output.srt -vvv
-```
-
-### Full Pipeline
-
-```bash
-# Run the complete pipeline
-python scripts/audio-process -i meeting.m4a -o output/
-
-# Keep temporary files for debugging
-python scripts/audio-process -i meeting.m4a -o output/ --keep-temp
-
-# Custom chunk size and overlap
-python scripts/audio-process -i meeting.m4a -o output/ --size-mb 25 --overlap 10
+python scripts/audio-transcribe-local -i chunks/ -o output.srt --model parakeet -vvv
+python scripts/audio-transcribe -i chunks/ -o output.srt -vvv  # Groq
 ```
 
 ## Options
 
-All scripts support:
-
 | Flag | Description |
 |------|-------------|
-| `-v`, `-vv`, `-vvv` | Increase verbosity (info, debug, trace) |
-| `-j`, `--threads` | Number of threads for ffmpeg (0 = all cores, default: 0) |
-
-### Threading
-
-By default, all scripts use all available CPU cores for ffmpeg operations. Override with:
-
-```bash
-python scripts/audio-normalize -i input.m4a -o output.wav -j 4
-```
-
-### Transcription Options
-
-```bash
-# Specify language (faster, more accurate)
-python scripts/audio-transcribe -i chunks/ -o output.srt -l en
-
-# Use different model
-python scripts/audio-transcribe -i chunks/ -o output.srt -m whisper-large-v3
-
-# Parallel API calls (default: 4)
-python scripts/audio-transcribe -i chunks/ -o output.srt -j 8
-```
-
-## Helper Scripts
-
-### Convert to WebVTT
-
-```bash
-# From Groq JSON output
-cat output.json | python groq-to-vtt.py > output.vtt
-
-# From Swama format
-cat input.txt | python swama-to-vtt.py > output.vtt
-```
+| `--engine local\|groq` | Transcription engine (default: groq) |
+| `--model` | Model name, fuzzy-matched for local (e.g. `parakeet`, `canary`) |
+| `--diarize` | Run speaker diarization (requires interactive terminal) |
+| `--num-speakers` | Known speaker count (diarization only) |
+| `-c, --continue` | Resume into existing output dir |
+| `--force` | Re-run all stages ignoring cache |
+| `--keep-temp` | Keep intermediate files |
+| `-v, -vv, -vvv` | Verbosity levels |
 
 ## Environment Variables
 
-| Variable | Description |
-|----------|-------------|
-| `GROQ_API_KEY` | Your Groq API key (required) |
-| `GROQ_MODEL` | Default Whisper model (optional) |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `HF_TOKEN` | `--diarize` | HuggingFace token for pyannote models |
+| `GROQ_API_KEY` | `--engine groq` | Groq API key |
 
-## Architecture
+## Local Models
 
+Models are auto-discovered from Handy.app's models directory:
+
+| Model | Type | Languages |
+|-------|------|-----------|
+| `parakeet-tdt-0.6b-v3-int8` | nemo-conformer-tdt | 25 European |
+| `canary-1b-v2` | nemo-conformer-aed | 25 European + translation |
+
+List available models:
+```bash
+python scripts/audio-transcribe-local -i dummy -o dummy
 ```
-┌─────────────────┐     ┌─────────────────┐
-│  audio-normalize │ ──► │  audio-enhance  │
-└─────────────────┘     └─────────────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │  audio-convert  │
-                         └─────────────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │   audio-split   │
-                         └─────────────────┘
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │audio-transcribe │
-                         └─────────────────┘
-```
-
-Each script does one thing well and can be used independently or chained together via `audio-process`.
 
 ## License
 

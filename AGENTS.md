@@ -1,7 +1,7 @@
-# AGENTS.md - Agent Guidelines for Groq STT Project
+# AGENTS.md - Agent Guidelines for Local-SST Project
 
 ## Project Overview
-Audio preprocessing pipeline for local/private transcription using Groq Speech-to-Text. Focus on Unix philosophy: one focus per script, stdio for piping, minimal dependencies.
+Audio preprocessing pipeline for transcription using local ONNX models (Parakeet, Canary) from Handy.app, with optional Groq cloud API. Focus on Unix philosophy: one focus per script, stdio for piping, minimal dependencies.
 
 ## Dependencies
 All Python packages must be installed via `uv`:
@@ -10,7 +10,7 @@ source .venv/bin/activate
 uv pip install <package>
 ```
 
-Required system dependency: `ffmpeg` (must be installed separately)
+Required: `ffmpeg` (system), `pydub`, `python-dotenv`, `onnx-asr[cpu,hub]`, `pyannote-audio`
 
 ---
 
@@ -18,171 +18,95 @@ Required system dependency: `ffmpeg` (must be installed separately)
 
 ### Environment Setup
 ```bash
-# Create and activate virtual environment
 uv venv
 source .venv/bin/activate
-
-# Install dependencies
-uv pip install pydub python-dotenv
+uv pip install pydub python-dotenv "onnx-asr[cpu,hub]" pyannote-audio
 ```
 
 ### Running Scripts
 ```bash
-# Single script usage
 python scripts/<script-name> --input audio.m4a --output ./out -vvv
-
-# Pipe usage (when supported)
-cat audio.m4a | python scripts/<script-name> -vvv > output.txt
 ```
 
 ### Linting
 ```bash
-# Run ruff (if configured)
 ruff check .
 ruff check --fix .
 ```
 
 ---
 
-## Code Style Guidelines
-
-### General
-- Shebang: `#!/usr/bin/env python3`
-- Encoding: UTF-8
-- Line length: max 100 characters
-- No trailing whitespace
-
-### Imports
-Order (alphabetical within groups):
-1. Standard library (`argparse`, `logging`, `subprocess`, etc.)
-2. Third-party (`pydub`, `dotenv`)
-3. Local (`src.*`)
-
-```python
-# Good
-import argparse
-import sys
-from pathlib import Path
-
-from pydub import AudioSegment
-from dotenv import load_dotenv
-
-from src.audio import load_audio
-from src.logging import setup_logging
-```
-
-### Naming
-- Functions/variables: `snake_case`
-- Classes: `PascalCase`
-- Constants: `UPPER_SNAKE_CASE`
-- Private functions: `_leading_underscore`
-
-### Type Hints
-Required for all function signatures:
-```python
-def process_audio(input_path: Path, output_dir: Path) -> int:
-    audio: AudioSegment = load_audio(input_path)
-    return 0
-```
-
-### Docstrings
-All public functions must have docstrings:
-```python
-def normalize_loudness(input_path: Path, output_path: Path, target_lufs: float = -16.0) -> None:
-    """Apply EBU R128 loudness normalization using ffmpeg.
-    
-    Args:
-        input_path: Path to input audio file
-        output_path: Path for output file
-        target_lufs: Target loudness in LUFS (default: -16)
-    """
-```
-
-### Error Handling
-- Use specific exceptions (`FileNotFoundError`, `ValueError`)
-- Return exit codes: `0` = success, `1` = error, `2` = invalid args
-- Log errors to stderr with context
-- Never expose secrets in error messages
-
----
-
-## Script Design Principles
-
-### One Focus
-Each script does exactly one thing:
-- `audio-normalize` - EBU R128 loudness normalization
-- `audio-enhance` - Voice enhancement filters (high/low pass)
-- `audio-convert` - Format/samplerate conversion
-- `audio-split` - Split by size with overlap
-
-### Interface Convention
-```
-<command> --input <file> --output <dir> [-v|-vv|-vvv]
-```
-
-### Output
-- Print result path to stdout on success
-- Print errors to stderr
-- Use verbose flag `-vvv` for debug logging
-
----
-
-## Secrets & Configuration
-
-### Environment Variables
-- Store in `.env` (never commit)
-- Template in `.env.example`
-- Use `python-dotenv` for loading
-
-```python
-from src.config import load_env, require_env
-
-load_env()
-api_key = require_env("GROQ_API_KEY")
-```
-
----
-
 ## File Structure
 ```
-groq-stt/
+local-sst/
 ├── src/
 │   ├── __init__.py
-│   ├── audio.py      # Audio loading utilities
-│   ├── logging.py    # Verbose logging setup
-│   └── config.py     # Environment/config helpers
+│   ├── audio.py           # Audio loading utilities
+│   ├── logging.py         # Verbose logging setup
+│   ├── config.py          # Environment/config helpers
+│   ├── srt.py             # SRT/VTT generation + parsing
+│   ├── transcribe.py      # Groq cloud transcription
+│   ├── local_transcribe.py # Local ONNX transcription engine
+│   └── diarize.py         # Speaker diarization (pyannote)
 ├── scripts/
 │   ├── audio-normalize
 │   ├── audio-enhance
 │   ├── audio-convert
-│   └── audio-split
+│   ├── audio-split
+│   ├── audio-transcribe       # Groq cloud
+│   ├── audio-transcribe-local  # Local ONNX
+│   └── audio-process           # Full pipeline orchestrator
 ├── .env.example
-├── .venv/            # Created by uv
-├── pyproject.toml    # Optional project config
-└── AGENTS.md         # This file
+├── pyproject.toml
+└── AGENTS.md
 ```
 
 ---
 
-## Testing
-No formal tests yet. Manual verification:
-```bash
-# Test audio-normalize
-python scripts/audio-normalize -i input.m4a -o output.wav -vvv
+## Code Style
 
-# Test full pipeline
-python scripts/audio-normalize -i input.m4a -o /tmp/normalized.wav
-python scripts/audio-enhance -i /tmp/normalized.wav -o /tmp/enhanced.wav
-```
+- Shebang: `#!/usr/bin/env python3`, line length max 100, UTF-8
+- Imports: stdlib → third-party → local (alphabetical within groups)
+- Naming: `snake_case` functions/vars, `PascalCase` classes, `UPPER_SNAKE_CASE` constants, `_leading_underscore` private
+- Type hints required on all function signatures
+- Docstrings required on all public functions
+- Return exit codes: `0` success, `1` error, `2` invalid args
+- Log errors to stderr, print results to stdout
 
 ---
+
+## Constraints
+
+### Audio Processing
+- **Do not load entire large audio files into memory** for duration/metadata. Use `ffprobe` or read headers only. Loading a 5-hour file into pydub consumes 20GB+ RAM.
+- **Use ffmpeg subprocess directly** for filter operations (highpass, lowpass, loudnorm) on large files. pydub's in-memory filters crash on files >1 hour.
+- **Convert compressed formats to 16kHz mono WAV** before passing to ONNX or pyannote. Compressed formats (Opus, MP3) have imprecise sample counts that cause chunking errors.
+
+### Pipeline
+- **Cache pipeline intermediates** between stages. Allow `--continue/-c` to resume a failed run without re-computing completed stages. Do not re-run a 5-minute normalize step because the script crashed at transcription.
+- **Refuse to run on non-empty output directories** without an explicit `--continue` or `--force` flag.
+
+### Subprocess & Interactive
+- **Stream child process output in real-time** when running sub-scripts. Do not use `capture_output=True` for long-running child processes — it buffers all output until completion, hiding progress.
+- **Check `sys.stdin.isatty()` before any interactive prompt.** If stdin is not a terminal, fail fast with a clear error. Do not let `input()` silently hang or EOF when piped or backgrounded.
+- **Handle `KeyboardInterrupt` in interactive prompts.** Save partial progress, write output, and exit cleanly. Users must be able to resume from where they stopped.
+
+### Transcription
+- **Default engine is `groq`** (cloud). Use `--engine local` for offline ONNX transcription with Parakeet/Canary models.
+- Models are auto-discovered from Handy.app's models directory on every run (lazy scan).
+- Diarization caches: WAV conversion (`*.diarize.wav`), diarization results (`*.diarization.json`), speaker labels (`*.speakers.json`). All three are persisted and reused on re-runs.
+
+---
+
+## Secrets & Configuration
+- Store in `.env` (never commit). Template in `.env.example`. Use `python-dotenv` for loading.
+- Required: `GROQ_API_KEY` (for Groq engine), `HF_TOKEN` (for diarization)
 
 ## Commit Guidelines
-- Use conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`
+- Conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`
 - Focus on "why", not "what"
-- Example: `feat: add audio-normalize script with EBU R128 support`
 - Always verify working before committing
+- Commit as atomic units (build individually, enabling git bisect)
 
 ## Agent Rules
-- when finished, commit your work as atomic units (they build individually allowing git bisect)
 - NEVER read `.env` or secret files
