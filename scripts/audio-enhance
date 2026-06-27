@@ -3,16 +3,36 @@
 
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pydub.effects import high_pass_filter, low_pass_filter
-
 from src.audio import get_audio_info, load_audio
 from src.config import resolve_output_path
 from src.logging import add_verbose_arg, setup_logging
+
+
+def enhance_audio(
+    input_path: Path,
+    output_path: Path,
+    high_pass: int = 80,
+    low_pass: int = 8000,
+    threads: int = 0,
+) -> None:
+    """Apply high-pass and low-pass filters using ffmpeg."""
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "warning",
+        "-threads", str(threads) if threads > 0 else str(os.cpu_count() or 1),
+        "-i", str(input_path),
+        "-af", f"highpass=f={high_pass},lowpass=f={low_pass}",
+        "-y",
+        str(output_path),
+    ]
+    subprocess.run(cmd, check=True)
 
 
 def main() -> int:
@@ -40,21 +60,22 @@ def main() -> int:
         logger.info(f"Audio: {info['duration_seconds']:.1f}s, {info['channels']}ch, {info['sample_rate']}Hz")
 
         logger.info(f"Applying filters: high-pass {args.high_pass}Hz, low-pass {args.low_pass}Hz")
-        audio = high_pass_filter(audio, args.high_pass)
-        audio = low_pass_filter(audio, args.low_pass)
-        logger.info("Enhancement complete")
-
         output_path = resolve_output_path(args.output, input_path, args.format)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        threads = args.threads or os.cpu_count() or 1
-        ffmpeg_params = ["-threads", str(threads)]
-        audio.export(str(output_path), format=args.format, parameters=ffmpeg_params)
+        enhance_audio(input_path, output_path, args.high_pass, args.low_pass, args.threads)
+        logger.info("Enhancement complete")
 
         logger.info(f"Done: {output_path}")
         print(str(output_path))
         return 0
 
+    except FileNotFoundError as e:
+        logger.error(f"File not found: {e}")
+        return 1
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg error: {e}")
+        return 1
     except Exception as e:
         logger.error(f"Error: {e}")
         return 1
