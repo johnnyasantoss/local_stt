@@ -49,7 +49,12 @@ Thumbs.db
 
 # Project specific
 output/
+output-*/
 chunks/
 *.ogg
 *.wav
+*.m4a
+*.diarize.wav
+*.diarization.json
+*.speakers.json
 .env
