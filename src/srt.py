@@ -1,6 +1,7 @@
 """SRT file generation utilities."""
 
 import math
+import re
 from dataclasses import dataclass
 
 
@@ -37,11 +38,13 @@ def format_seconds_to_srt(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def segments_to_srt(segments: list[dict]) -> str:
-    """Convert Groq API segments to SRT format.
+def segments_to_srt(segments: list[dict], include_speakers: bool = False) -> str:
+    """Convert segments to SRT format.
 
     Args:
         segments: List of segment dicts with 'start', 'end', 'text' keys
+        include_speakers: If True and segment has 'speaker' field,
+                          prefix text with 'Speaker {label}: '
 
     Returns:
         SRT formatted string
@@ -51,6 +54,8 @@ def segments_to_srt(segments: list[dict]) -> str:
         text = seg.get("text", "").strip()
         if not text:
             continue
+        if include_speakers and "speaker" in seg:
+            text = f"Speaker {seg['speaker']}: {text}"
         entry = SRTEntry(
             index=idx,
             start_time=seg.get("start", 0.0),
@@ -95,3 +100,55 @@ def deduplicate_segments(segments: list[dict], overlap_threshold: float = 0.5) -
                 prev["text"] = prev.get("text", "") + " " + seg["text"]
 
     return merged
+
+
+_SRT_TIME_RE = re.compile(r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})")
+_SPEAKER_RE = re.compile(r"^Speaker\s+(.+?):\s*(.*)")
+
+
+def _parse_srt_time(time_str: str) -> float:
+    """Parse SRT timestamp HH:MM:SS,mmm to seconds."""
+    match = _SRT_TIME_RE.match(time_str.strip())
+    if not match:
+        raise ValueError(f"Invalid SRT timestamp: {time_str}")
+    h, m, s, ms = map(int, match.groups())
+    return h * 3600 + m * 60 + s + ms / 1000.0
+
+
+def parse_srt(srt_content: str) -> list[dict]:
+    """Parse SRT content into segment dicts.
+
+    Args:
+        srt_content: SRT formatted string
+
+    Returns:
+        List of {"start": float, "end": float, "text": str, "speaker": str|None}
+    """
+    blocks = re.split(r"\n\s*\n", srt_content.strip())
+    segments = []
+
+    for block in blocks:
+        lines = [l for l in block.strip().split("\n") if l.strip()]
+        if len(lines) < 3:
+            continue
+
+        time_line = lines[1]
+        time_match = _SRT_TIME_RE.findall(time_line)
+        if len(time_match) != 2:
+            continue
+
+        start = _parse_srt_time(time_line)
+        end = _parse_srt_time(time_line.split("-->")[1])
+
+        text_lines = lines[2:]
+        text = " ".join(text_lines).strip()
+
+        speaker = None
+        sp_match = _SPEAKER_RE.match(text)
+        if sp_match:
+            speaker = sp_match.group(1).strip()
+            text = sp_match.group(2).strip()
+
+        segments.append({"start": start, "end": end, "text": text, "speaker": speaker})
+
+    return segments
