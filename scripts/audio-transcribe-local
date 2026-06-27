@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Transcribe audio files locally using ONNX models from Handy.app."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from dotenv import load_dotenv
+
+from src.local_transcribe import discover_models, transcribe_local
+from src.logging import add_verbose_arg, setup_logging
+from src.srt import segments_to_srt, parse_srt
+
+load_dotenv()
+
+AUDIO_EXTENSIONS = [".ogg", ".opus", ".wav", ".m4a", ".mp3", ".flac", ".webm"]
+
+
+def _find_full_audio(input_path: Path) -> Path:
+    """Auto-detect the full continuous audio file for diarization.
+
+    If input is a file, use it directly.
+    If input is a chunks dir, look in parent for processed.{ext}.
+    """
+    if input_path.is_file():
+        return input_path
+
+    parent = input_path.parent
+    for ext in AUDIO_EXTENSIONS:
+        candidate = parent / f"processed{ext}"
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        f"Could not find full audio file for diarization. "
+        f"Expected processed.{{{'|'.join(AUDIO_EXTENSIONS)}}} in {parent}."
+    )
+
+
+def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Transcribe audio locally using ONNX models from Handy.app"
+    )
+    add_verbose_arg(parser)
+    parser.add_argument("-i", "--input", type=Path, required=True,
+                        help="Input audio file or directory of chunks")
+    parser.add_argument("-o", "--output", type=Path, required=True,
+                        help="Output .srt file")
+    parser.add_argument("-m", "--model", default=None,
+                        help="Model name or path (fuzzy matched). "
+                             "If omitted, lists available models.")
+    parser.add_argument("-l", "--language",
+                        help="Language code (e.g., en). Required for Canary.")
+    parser.add_argument("--vad-threshold", type=float, default=0.5,
+                        help="VAD speech detection threshold (default: 0.5)")
+    parser.add_argument("--overlap-secs", type=float, default=5.0,
+                        help="Overlap seconds for chunk merging (default: 5)")
+    parser.add_argument("-j", "--parallel", type=int, default=4,
+                        help="Parallel workers for chunk directory (default: 4)")
+    parser.add_argument("--diarize", action="store_true",
+                        help="Run speaker diarization and label speakers")
+    parser.add_argument("--num-speakers", type=int, default=None,
+                        help="Known number of speakers (optional)")
+    parser.add_argument("--speakers-file", type=Path, default=None,
+                        help="Path to .speakers.json mapping (skip interactive prompt)")
+
+    args = parser.parse_args()
+    logger = setup_logging(args.v)
+
+    if args.model is None:
+        models = discover_models()
+        if not models:
+            logger.error("No supported models found in Handy models directory")
+            return 1
+        print("Available models:")
+        for m in models:
+            print(f"  {m['name']:30s}  {m['model_type']:25s}  {m['size_mb']:.0f} MB")
+        return 0
+
+    try:
+        if args.output.exists() and args.output.stat().st_size > 0:
+            logger.info(f"Loading existing transcription: {args.output}")
+            segments = parse_srt(args.output.read_text(encoding="utf-8"))
+            logger.info(f"Loaded {len(segments)} segments from SRT")
+        else:
+            segments = transcribe_local(
+                input_path=args.input,
+                model_query=args.model,
+                language=args.language,
+                vad_threshold=args.vad_threshold,
+                overlap_secs=args.overlap_secs,
+                parallel=args.parallel,
+                logger=logger,
+            )
+
+        include_speakers = False
+
+        if args.diarize:
+            import json
+
+            from src.diarize import (
+                apply_speaker_labels,
+                assign_speakers_to_segments,
+                diarize_audio,
+                get_speaker_samples,
+                load_speaker_mapping,
+                prompt_speaker_labels,
+                save_speaker_mapping,
+            )
+
+            speaker_labels = None
+
+            if args.speakers_file and args.speakers_file.exists():
+                speaker_labels = load_speaker_mapping(args.speakers_file)
+                logger.info(f"Loaded speaker mapping from {args.speakers_file}")
+
+            if speaker_labels is None:
+                default_sp_path = args.output.with_suffix(".speakers.json")
+                if default_sp_path.exists():
+                    speaker_labels = load_speaker_mapping(default_sp_path)
+                    logger.info(f"Loaded speaker mapping from {default_sp_path}")
+
+            # Load cached diarization if available, otherwise run it
+            diar_cache_path = args.output.with_suffix(".diarization.json")
+            if diar_cache_path.exists():
+                logger.info(f"Loading cached diarization: {diar_cache_path}")
+                diarization_segments = json.loads(
+                    diar_cache_path.read_text(encoding="utf-8")
+                )
+                logger.info(f"Loaded {len(diarization_segments)} diarization segments")
+            else:
+                diarization_segments = diarize_audio(
+                    audio_path=_find_full_audio(args.input),
+                    num_speakers=args.num_speakers,
+                    cache_dir=args.output.parent,
+                    logger=logger,
+                )
+                diar_cache_path.write_text(
+                    json.dumps(diarization_segments, indent=2), encoding="utf-8"
+                )
+                logger.info(f"Saved diarization cache to {diar_cache_path}")
+
+            # Always assign speakers to segments (needed for labeling)
+            segments = assign_speakers_to_segments(segments, diarization_segments)
+
+            # Prompt for speaker labels (shows saved labels as defaults)
+            samples, counts = get_speaker_samples(segments)
+            speaker_labels = prompt_speaker_labels(
+                samples, counts, existing_labels=speaker_labels
+            )
+            sp_path = args.output.with_suffix(".speakers.json")
+            save_speaker_mapping(speaker_labels, sp_path)
+            logger.info(f"Saved speaker mapping to {sp_path}")
+
+            segments = apply_speaker_labels(segments, speaker_labels)
+            include_speakers = True
+
+        srt_content = segments_to_srt(segments, include_speakers=include_speakers)
+
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(srt_content, encoding="utf-8")
+
+        print(str(args.output))
+        return 0
+
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
