@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Full audio processing pipeline: normalize -> enhance -> convert -> split."""
+"""Full audio processing pipeline: normalize -> enhance -> convert -> split -> transcribe.
+
+Intermediate files are cached in <output>/intermediates/ and reused on re-runs.
+A stage is skipped if its output file already exists (use --force to re-run all).
+"""
 
 import argparse
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -13,29 +16,65 @@ from src.logging import setup_logging, add_verbose_arg
 
 
 def run_script(script: str, args: list, logger, threads: int = 0) -> subprocess.CompletedProcess:
-    """Run a script and return the result."""
+    """Run a script, streaming stdout/stderr to the pipeline log in real-time.
+
+    Returns a CompletedProcess with captured stdout (for scripts that print output paths).
+    """
     if threads > 0:
         args = ["-j", str(threads)] + args
     cmd = ["python", f"scripts/{script}"] + args
     logger.debug(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return result
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    captured_lines = []
+    for line in proc.stdout:
+        line = line.rstrip()
+        if not line:
+            continue
+        # Print child output so it appears in the pipeline log immediately
+        print(line, flush=True)
+        captured_lines.append(line)
+
+    proc.wait()
+    stdout = "\n".join(captured_lines)
+    return subprocess.CompletedProcess(args=cmd, returncode=proc.returncode, stdout=stdout)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Full audio processing pipeline: normalize -> enhance -> convert -> split"
+        description="Full audio processing pipeline: normalize -> enhance -> convert -> split -> transcribe"
     )
     add_verbose_arg(parser)
     parser.add_argument("-i", "--input", type=Path, required=True, help="Input audio file")
     parser.add_argument("-o", "--output", type=Path, required=True, help="Output directory")
-    parser.add_argument("--keep-temp", action="store_true", help="Keep temporary files")
+    parser.add_argument("--keep-temp", action="store_true", help="Keep intermediate files")
     parser.add_argument("--overlap", type=int, default=5, help="Chunk overlap seconds (default: 5)")
     parser.add_argument("--size-mb", type=float, default=10, help="Max chunk size MiB (default: 10)")
     parser.add_argument(
         "-j", "--threads", type=int, default=0,
         help="Number of threads (0 = all cores, default: 0)"
     )
+    parser.add_argument("--engine", choices=["groq", "local"], default="groq",
+                        help="Transcription engine (default: groq)")
+    parser.add_argument("--model",
+                        help="Model: Groq model name (groq engine) or local model name (local engine)")
+    parser.add_argument("--language",
+                        help="Language code (e.g., en)")
+    parser.add_argument("--diarize", action="store_true",
+                        help="Run speaker diarization (local engine only)")
+    parser.add_argument("--num-speakers", type=int, default=None,
+                        help="Known number of speakers (local engine only)")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-run all stages even if intermediates exist")
+    parser.add_argument("-c", "--continue", action="store_true", dest="continue_run",
+                        help="Continue into output dir that already has data "
+                             "(without this, refuses to run on non-empty output)")
 
     args = parser.parse_args()
     logger = setup_logging(args.v)
@@ -45,16 +84,28 @@ def main() -> int:
         output_dir = args.output.resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Safety: refuse to run on non-empty output dir unless --continue or --force
+        existing = [p for p in output_dir.iterdir() if p.name != "pipeline.log"]
+        if existing and not (args.continue_run or args.force):
+            logger.error(
+                f"Output dir '{output_dir}' already contains {len(existing)} item(s). "
+                "Use --continue/-c to resume, or --force to re-run from scratch."
+            )
+            return 1
+
+        inter_dir = output_dir / "intermediates"
+        inter_dir.mkdir(parents=True, exist_ok=True)
+
         logger.info("=" * 50)
         logger.info("Starting audio processing pipeline")
         logger.info("=" * 50)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-
-            # Stage 1: Normalize
-            logger.info("[1/4] Normalizing loudness...")
-            norm_out = tmp / "normalized.wav"
+        # Stage 1: Normalize
+        norm_out = inter_dir / "normalized.wav"
+        if norm_out.exists() and not args.force:
+            logger.info(f"[1/5] Normalize: cached ({norm_out.name})")
+        else:
+            logger.info("[1/5] Normalizing loudness...")
             result = run_script(
                 "audio-normalize",
                 ["-i", str(input_path), "-o", str(norm_out), "-v" * args.v],
@@ -66,9 +117,12 @@ def main() -> int:
                 return 1
             logger.info(f"  -> {norm_out}")
 
-            # Stage 2: Enhance
-            logger.info("[2/4] Enhancing voice...")
-            enh_out = tmp / "enhanced.wav"
+        # Stage 2: Enhance
+        enh_out = inter_dir / "enhanced.wav"
+        if enh_out.exists() and not args.force:
+            logger.info(f"[2/5] Enhance: cached ({enh_out.name})")
+        else:
+            logger.info("[2/5] Enhancing voice...")
             result = run_script(
                 "audio-enhance",
                 ["-i", str(norm_out), "-o", str(enh_out), "-v" * args.v],
@@ -80,9 +134,12 @@ def main() -> int:
                 return 1
             logger.info(f"  -> {enh_out}")
 
-            # Stage 3: Convert
-            logger.info("[3/4] Converting to 16kHz mono Opus...")
-            conv_out = output_dir / "processed.ogg"
+        # Stage 3: Convert
+        conv_out = output_dir / "processed.ogg"
+        if conv_out.exists() and not args.force:
+            logger.info(f"[3/5] Convert: cached ({conv_out.name})")
+        else:
+            logger.info("[3/5] Converting to 16kHz mono Opus...")
             result = run_script(
                 "audio-convert",
                 ["-i", str(enh_out), "-o", str(conv_out), "-v" * args.v],
@@ -94,9 +151,13 @@ def main() -> int:
                 return 1
             logger.info(f"  -> {conv_out}")
 
-            # Stage 4: Split
-            logger.info("[4/4] Splitting by size...")
-            split_dir = output_dir / "chunks"
+        # Stage 4: Split
+        split_dir = output_dir / "chunks"
+        if split_dir.exists() and any(split_dir.iterdir()) and not args.force:
+            chunk_files = sorted(split_dir.glob("*"))
+            logger.info(f"[4/5] Split: cached ({len(chunk_files)} chunks)")
+        else:
+            logger.info("[4/5] Splitting by size...")
             result = run_script(
                 "audio-split",
                 ["-i", str(conv_out), "-o", str(split_dir), "--size-mb", str(args.size_mb),
@@ -111,19 +172,63 @@ def main() -> int:
             chunk_files = [Path(p) for p in result.stdout.strip().split("\n") if p]
             logger.info(f"  -> Created {len(chunk_files)} chunks in {split_dir}")
 
+        # Stage 5: Transcribe
+        transcription_path = output_dir / "transcription.srt"
+        if transcription_path.exists() and not args.force:
+            logger.info(f"[5/5] Transcribe: cached ({transcription_path.name})")
+        else:
+            logger.info("[5/5] Transcribing...")
+
+            if args.engine == "local":
+                local_args = [
+                    "-i", str(split_dir),
+                    "-o", str(transcription_path),
+                    "-v" * args.v,
+                ]
+                if args.model:
+                    local_args.extend(["--model", args.model])
+                if args.language:
+                    local_args.extend(["--language", args.language])
+                if args.diarize:
+                    local_args.append("--diarize")
+                if args.num_speakers is not None:
+                    local_args.extend(["--num-speakers", str(args.num_speakers)])
+                result = run_script("audio-transcribe-local", local_args, logger)
+            else:
+                trans_args = [
+                    "-i", str(split_dir),
+                    "-o", str(transcription_path),
+                    "-v" * args.v,
+                ]
+                if args.model:
+                    trans_args.extend(["--model", args.model])
+                if args.language:
+                    trans_args.extend(["--language", args.language])
+                result = run_script("audio-transcribe", trans_args, logger)
+
+            if result.returncode != 0:
+                logger.error(f"transcribe failed: {result.stderr}")
+                return 1
+            logger.info(f"  -> {transcription_path}")
+
         logger.info("=" * 50)
         logger.info("Pipeline complete!")
         logger.info(f"  Output: {output_dir}")
         logger.info(f"  Chunks: {len(chunk_files)}")
-
-        if args.keep_temp:
-            logger.info(f"  Temp: {conv_out}")
+        logger.info(f"  Transcript: {transcription_path}")
 
         return 0
 
     except Exception as e:
         logger.error(f"Error: {e}")
         return 1
+
+    finally:
+        # Always clean intermediates unless --keep-temp, even on error/kill
+        if not args.keep_temp:
+            import shutil
+            shutil.rmtree(inter_dir, ignore_errors=True)
+            logger.info("  Cleaned intermediates (use --keep-temp to retain)")
 
 
 if __name__ == "__main__":
