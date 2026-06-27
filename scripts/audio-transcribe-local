@@ -100,6 +100,14 @@ def main() -> int:
 
         if args.diarize:
             import json
+            import sys as _sys
+
+            if not _sys.stdin.isatty():
+                logger.error(
+                    "Diarization requires an interactive terminal for speaker labeling. "
+                    "Run directly in your terminal (not piped or backgrounded)."
+                )
+                return 1
 
             from src.diarize import (
                 apply_speaker_labels,
