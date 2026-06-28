@@ -236,7 +236,7 @@ def prompt_speaker_labels(
     samples: dict[str, list[dict]],
     counts: dict[str, int],
     existing_labels: dict[str, str] | None = None,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], bool]:
     """Interactive CLI prompt for labeling speakers.
 
     Shows sample text with timestamps so the user can navigate to that
@@ -246,14 +246,16 @@ def prompt_speaker_labels(
     (press Enter to keep it). Re-asks all speakers each run so the user
     can correct previous labels.
 
-    On Ctrl+C, returns whatever labels were entered so far (partial).
+    Returns (labels, finalized). finalized is True only if the user
+    labeled all speakers without interruption.
     """
     labels = {}
+    finalized = True
     prev = existing_labels or {}
 
     all_speakers = sorted(samples.keys())
     if not all_speakers:
-        return labels
+        return labels, finalized
 
     print(f"\n  {len(all_speakers)} speaker(s) to label (Ctrl+C to save and exit):\n")
 
@@ -274,13 +276,14 @@ def prompt_speaker_labels(
             print()
 
     except KeyboardInterrupt:
+        finalized = False
         print("\n  Interrupted. Saving partial labels...")
         # Merge: keep any not-yet-asked speakers from previous labels
         for speaker_id in all_speakers:
             if speaker_id not in labels:
                 labels[speaker_id] = prev.get(speaker_id, speaker_id)
 
-    return labels
+    return labels, finalized
 
 
 def apply_speaker_labels(
@@ -296,13 +299,36 @@ def apply_speaker_labels(
     return result
 
 
-def save_speaker_mapping(labels: dict[str, str], output_path: Path) -> None:
-    """Save speaker mapping to JSON sidecar file."""
-    output_path.write_text(json.dumps(labels, indent=2), encoding="utf-8")
+def save_speaker_mapping(
+    labels: dict[str, str],
+    output_path: Path,
+    finalized: bool = False,
+) -> None:
+    """Save speaker mapping to JSON sidecar file.
+
+    Args:
+        labels: Mapping of speaker IDs to human-readable names.
+        output_path: Path to write the JSON file.
+        finalized: True if the user completed labeling (not interrupted).
+    """
+    data = {"finalized": finalized, "labels": labels}
+    output_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-def load_speaker_mapping(input_path: Path) -> dict[str, str] | None:
-    """Load speaker mapping from JSON sidecar file if it exists."""
-    if input_path.exists():
-        return json.loads(input_path.read_text(encoding="utf-8"))
-    return None
+def load_speaker_mapping(
+    input_path: Path,
+) -> tuple[dict[str, str], bool] | None:
+    """Load speaker mapping from JSON sidecar file if it exists.
+
+    Returns (labels, finalized) or None if file doesn't exist.
+    Handles both old flat format {speaker: label} and new format
+    {"finalized": bool, "labels": {speaker: label}}.
+    """
+    if not input_path.exists():
+        return None
+    data = json.loads(input_path.read_text(encoding="utf-8"))
+    # New format: {"finalized": bool, "labels": {...}}
+    if isinstance(data, dict) and "labels" in data:
+        return data["labels"], data.get("finalized", False)
+    # Old flat format: {"SPEAKER_00": "Alice", ...} (backward compat)
+    return data, False

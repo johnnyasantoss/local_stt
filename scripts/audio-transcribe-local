@@ -120,15 +120,19 @@ def main() -> int:
             )
 
             speaker_labels = None
+            speaker_finalized = False
 
             if args.speakers_file and args.speakers_file.exists():
-                speaker_labels = load_speaker_mapping(args.speakers_file)
-                logger.info(f"Loaded speaker mapping from {args.speakers_file}")
+                result = load_speaker_mapping(args.speakers_file)
+                if result is not None:
+                    speaker_labels, speaker_finalized = result
+                    logger.info(f"Loaded speaker mapping from {args.speakers_file}")
 
             if speaker_labels is None:
                 default_sp_path = args.output.with_suffix(".speakers.json")
-                if default_sp_path.exists():
-                    speaker_labels = load_speaker_mapping(default_sp_path)
+                result = load_speaker_mapping(default_sp_path)
+                if result is not None:
+                    speaker_labels, speaker_finalized = result
                     logger.info(f"Loaded speaker mapping from {default_sp_path}")
 
             # Load cached diarization if available, otherwise run it
@@ -154,13 +158,17 @@ def main() -> int:
             # Always assign speakers to segments (needed for labeling)
             segments = assign_speakers_to_segments(segments, diarization_segments)
 
-            # Prompt for speaker labels (shows saved labels as defaults)
-            samples, counts = get_speaker_samples(segments)
-            speaker_labels = prompt_speaker_labels(
-                samples, counts, existing_labels=speaker_labels
-            )
+            if speaker_finalized:
+                logger.info("Using finalized speaker labels (skipping prompt)")
+            else:
+                # Prompt for speaker labels (shows saved labels as defaults)
+                samples, counts = get_speaker_samples(segments)
+                speaker_labels, speaker_finalized = prompt_speaker_labels(
+                    samples, counts, existing_labels=speaker_labels
+                )
+
             sp_path = args.output.with_suffix(".speakers.json")
-            save_speaker_mapping(speaker_labels, sp_path)
+            save_speaker_mapping(speaker_labels, sp_path, finalized=speaker_finalized)
             logger.info(f"Saved speaker mapping to {sp_path}")
 
             segments = apply_speaker_labels(segments, speaker_labels)
