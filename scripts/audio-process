@@ -105,8 +105,8 @@ examples:
   # Local offline transcription with diarization
   audio-process -i meeting.m4a -o ./out --engine local --diarize --num-speakers 3
 
-  # Force full re-run, keep intermediates for debugging
-  audio-process -i recording.m4a -o ./out --force --keep-temp
+  # Force full re-run, clean intermediates after
+  audio-process -i recording.m4a -o ./out --force --clean-temp
 
 pipeline stages:
   1. Normalize   - loudness normalization (EBU R128)
@@ -158,14 +158,14 @@ pipeline stages:
         ),
     )
     parser.add_argument(
-        "--keep-temp",
+        "--clean-temp",
         action="store_true",
         default=False,
         help=(
-            "Retain intermediate files in <output>/intermediates/ after the "
+            "Delete intermediate files in <output>/intermediates/ after the "
             "pipeline finishes. By default, normalized, enhanced, and converted "
-            "WAV/OGG files are deleted on completion (even on error). Useful for "
-            "debugging or re-running individual stages manually. (default: false)"
+            "WAV/OGG files are retained for debugging or re-running individual "
+            "stages manually. (default: false)"
         ),
     )
     parser.add_argument(
@@ -307,6 +307,18 @@ pipeline stages:
         logger.info("Starting audio processing pipeline")
         logger.info("=" * 50)
 
+        # Fast resume: if transcription already exists and not forcing, skip everything
+        transcription_path = output_dir / "transcription.srt"
+        if transcription_path.exists() and not args.force:
+            chunk_files = sorted((output_dir / "chunks").glob("*")) if (output_dir / "chunks").exists() else []
+            logger.info("Transcription already exists, skipping all stages.")
+            logger.info("=" * 50)
+            logger.info("Pipeline complete!")
+            logger.info(f"  Output: {output_dir}")
+            logger.info(f"  Chunks: {len(chunk_files)}")
+            logger.info(f"  Transcript: {transcription_path}")
+            return 0
+
         # Stage 1: Normalize
         norm_out = inter_dir / "normalized.wav"
         if norm_out.exists() and not args.force:
@@ -380,7 +392,6 @@ pipeline stages:
             logger.info(f"  -> Created {len(chunk_files)} chunks in {split_dir}")
 
         # Stage 5: Transcribe
-        transcription_path = output_dir / "transcription.srt"
         if transcription_path.exists() and not args.force:
             logger.info(f"[5/5] Transcribe: cached ({transcription_path.name})")
         else:
@@ -431,11 +442,11 @@ pipeline stages:
         return 1
 
     finally:
-        # Always clean intermediates unless --keep-temp, even on error/kill
-        if not args.keep_temp:
+        # Clean intermediates only if --clean-temp, even on error/kill
+        if args.clean_temp:
             import shutil
             shutil.rmtree(inter_dir, ignore_errors=True)
-            logger.info("  Cleaned intermediates (use --keep-temp to retain)")
+            logger.info("  Cleaned intermediates")
 
 
 if __name__ == "__main__":
