@@ -82,7 +82,7 @@ python scripts/audio-transcribe -i chunks/ -o output.srt -vvv  # Groq
 | `--num-speakers` | Known speaker count (diarization only) |
 | `-c, --continue` | Resume into existing output dir |
 | `--force` | Re-run all stages ignoring cache |
-| `--keep-temp` | Keep intermediate files |
+| `--clean-temp` | Delete intermediate files after pipeline finishes |
 | `-v, -vv, -vvv` | Verbosity levels |
 | `--language` | ISO 639-1 language code hint (e.g. `en`, `es`). Auto-detects if omitted. |
 | `-j, --threads` | Parallel worker threads. 0 = all cores (default: 0). |
