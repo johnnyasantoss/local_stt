@@ -44,7 +44,7 @@ def segments_to_srt(segments: list[dict], include_speakers: bool = False) -> str
     Args:
         segments: List of segment dicts with 'start', 'end', 'text' keys
         include_speakers: If True and segment has 'speaker' field,
-                          prefix text with 'Speaker {label}: '
+                          prefix text with '[{label}]: '
 
     Returns:
         SRT formatted string
@@ -55,7 +55,7 @@ def segments_to_srt(segments: list[dict], include_speakers: bool = False) -> str
         if not text:
             continue
         if include_speakers and "speaker" in seg:
-            text = f"Speaker {seg['speaker']}: {text}"
+            text = f"[{seg['speaker']}]: {text}"
         entry = SRTEntry(
             index=idx,
             start_time=seg.get("start", 0.0),
@@ -103,7 +103,7 @@ def deduplicate_segments(segments: list[dict], overlap_threshold: float = 0.5) -
 
 
 _SRT_TIME_RE = re.compile(r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})")
-_SPEAKER_RE = re.compile(r"^Speaker\s+(.+?):\s*(.*)")
+_SPEAKER_RE = re.compile(r"^\[(.+?)\]:\s*(.*)")
 
 
 def _parse_srt_time(time_str: str) -> float:

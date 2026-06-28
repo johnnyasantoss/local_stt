@@ -249,6 +249,8 @@ def prompt_speaker_labels(
     Returns (labels, finalized). finalized is True only if the user
     labeled all speakers without interruption.
     """
+    import re
+
     labels = {}
     finalized = True
     prev = existing_labels or {}
@@ -257,22 +259,32 @@ def prompt_speaker_labels(
     if not all_speakers:
         return labels, finalized
 
-    print(f"\n  {len(all_speakers)} speaker(s) to label (Ctrl+C to save and exit):\n")
+    print(f"\n  {len(all_speakers)} speaker(s) found.\n")
+    print("  For each speaker, listen to the audio at the timestamp below,")
+    print("  then enter the speaker's name (or press Enter to keep the default).\n")
+    print("  Ctrl+C to save partial labels and exit.\n")
 
     try:
         for speaker_id in all_speakers:
             segs = samples[speaker_id]
             count = counts[speaker_id]
-            default = prev.get(speaker_id, speaker_id)
+            default = prev.get(speaker_id, "")
 
             print(f"  {speaker_id} ({count} segments)")
             for seg in segs:
                 ts = _format_timestamp(seg["start"])
-                preview = seg["text"][:80] + ("..." if len(seg["text"]) > 80 else "")
+                # Strip any leftover speaker prefix from cached SRT text
+                text = seg["text"]
+                text = re.sub(r"^\[.+?\]:\s*", "", text)
+                preview = text[:80] + ("..." if len(text) > 80 else "")
                 print(f'    [{ts}] "{preview}"')
 
-            label = input(f"  Label [{default}]: ").strip()
-            labels[speaker_id] = label if label else default
+            if default:
+                prompt = f"  Enter name for {speaker_id} [{default}]: "
+            else:
+                prompt = f"  Enter name for {speaker_id}: "
+            label = input(prompt).strip()
+            labels[speaker_id] = label if label else (default or speaker_id)
             print()
 
     except KeyboardInterrupt:
