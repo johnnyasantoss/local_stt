@@ -12,7 +12,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.logging import setup_logging, add_verbose_arg
+from src.logging import setup_logging
+from src.config import load_env
+from src.local_transcribe import resolve_model
 
 
 def run_script(script: str, args: list, logger, threads: int = 0) -> subprocess.CompletedProcess:
@@ -35,8 +37,6 @@ def run_script(script: str, args: list, logger, threads: int = 0) -> subprocess.
     captured_lines = []
     for line in proc.stdout:
         line = line.rstrip()
-        if not line:
-            continue
         # Print child output so it appears in the pipeline log immediately
         print(line, flush=True)
         captured_lines.append(line)
@@ -46,38 +46,245 @@ def run_script(script: str, args: list, logger, threads: int = 0) -> subprocess.
     return subprocess.CompletedProcess(args=cmd, returncode=proc.returncode, stdout=stdout)
 
 
+def validate_args(args, logger) -> bool:
+    """Validate flag combinations before any pipeline work starts.
+
+    Returns True if valid, False otherwise (errors are logged to stderr).
+    """
+    valid = True
+
+    # --num-speakers requires --diarize
+    if args.num_speakers is not None and not args.diarize:
+        logger.error("--num-speakers has no effect without --diarize")
+        valid = False
+
+    # Engine-specific checks
+    if args.engine == "groq":
+        load_env()
+        import os
+        if not os.getenv("GROQ_API_KEY"):
+            logger.error(
+                "--engine groq requires GROQ_API_KEY. "
+                "Set it in .env or export it."
+            )
+            valid = False
+
+    if args.engine == "local":
+        # Validate model early if provided
+        if args.model:
+            try:
+                resolve_model(args.model)
+            except ValueError as e:
+                logger.error(str(e))
+                valid = False
+
+        # HF_TOKEN required if diarize requested
+        if args.diarize:
+            load_env()
+            import os
+            if not os.getenv("HF_TOKEN"):
+                logger.error(
+                    "--diarize requires HF_TOKEN. "
+                    "Set it in .env with a HuggingFace token that has "
+                    "accepted pyannote/speaker-diarization-3.1 conditions."
+                )
+                valid = False
+
+    return valid
+
+
 def main() -> int:
+    epilog = """\
+examples:
+  # Basic transcription via Groq cloud
+  audio-process -i recording.m4a -o ./out
+
+  # Resume a crashed run
+  audio-process -i recording.m4a -o ./out -c
+
+  # Local offline transcription with diarization
+  audio-process -i meeting.m4a -o ./out --engine local --diarize --num-speakers 3
+
+  # Force full re-run, keep intermediates for debugging
+  audio-process -i recording.m4a -o ./out --force --keep-temp
+
+pipeline stages:
+  1. Normalize   - loudness normalization (EBU R128)
+  2. Enhance     - voice band isolation (highpass/lowpass)
+  3. Convert     - resample to 16kHz mono Opus
+  4. Split       - chunk by size with overlap
+  5. Transcribe  - Groq cloud or local ONNX model
+"""
+
     parser = argparse.ArgumentParser(
-        description="Full audio processing pipeline: normalize -> enhance -> convert -> split -> transcribe"
+        description=(
+            "Full audio processing pipeline: normalize -> enhance -> convert -> split -> transcribe.\n"
+            "Intermediate files are cached in <output>/intermediates/ and reused on re-runs.\n"
+            "A stage is skipped if its output file already exists (use --force to re-run all)."
+        ),
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    add_verbose_arg(parser)
-    parser.add_argument("-i", "--input", type=Path, required=True, help="Input audio file")
-    parser.add_argument("-o", "--output", type=Path, required=True, help="Output directory")
-    parser.add_argument("--keep-temp", action="store_true", help="Keep intermediate files")
-    parser.add_argument("--overlap", type=int, default=5, help="Chunk overlap seconds (default: 5)")
-    parser.add_argument("--size-mb", type=float, default=10, help="Max chunk size MiB (default: 10)")
     parser.add_argument(
-        "-j", "--threads", type=int, default=0,
-        help="Number of threads (0 = all cores, default: 0)"
+        "-v", "-vv", "-vvv",
+        action="count",
+        default=0,
+        help=(
+            "Increase verbosity. Can be stacked: -v for info-level logging, "
+            "-vv for debug-level, -vvv for trace-level. Controls both this script's "
+            "output and the output of sub-scripts (normalize, enhance, etc.). "
+            "(default: 0)"
+        ),
     )
-    parser.add_argument("--engine", choices=["groq", "local"], default="groq",
-                        help="Transcription engine (default: groq)")
-    parser.add_argument("--model",
-                        help="Model: Groq model name (groq engine) or local model name (local engine)")
-    parser.add_argument("--language",
-                        help="Language code (e.g., en)")
-    parser.add_argument("--diarize", action="store_true",
-                        help="Run speaker diarization (local engine only)")
-    parser.add_argument("--num-speakers", type=int, default=None,
-                        help="Known number of speakers (local engine only)")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-run all stages even if intermediates exist")
-    parser.add_argument("-c", "--continue", action="store_true", dest="continue_run",
-                        help="Continue into output dir that already has data "
-                             "(without this, refuses to run on non-empty output)")
+    parser.add_argument(
+        "-i", "--input",
+        type=Path,
+        required=True,
+        help=(
+            "Path to the input audio file. Supports common formats including "
+            "M4A, MP3, WAV, OGG, FLAC, and Opus. The file is read by ffmpeg for "
+            "all processing stages. Must be a readable file on disk."
+        ),
+    )
+    parser.add_argument(
+        "-o", "--output",
+        type=Path,
+        required=True,
+        help=(
+            "Path to the output directory. Created automatically if it does not "
+            "exist. If the directory already contains files, the script refuses "
+            "to run unless --continue or --force is passed. All output (chunks, "
+            "transcription SRT, intermediates) is written here."
+        ),
+    )
+    parser.add_argument(
+        "--keep-temp",
+        action="store_true",
+        default=False,
+        help=(
+            "Retain intermediate files in <output>/intermediates/ after the "
+            "pipeline finishes. By default, normalized, enhanced, and converted "
+            "WAV/OGG files are deleted on completion (even on error). Useful for "
+            "debugging or re-running individual stages manually. (default: false)"
+        ),
+    )
+    parser.add_argument(
+        "--overlap",
+        type=int,
+        default=5,
+        help=(
+            "Overlap in seconds between consecutive audio chunks during the "
+            "split stage. Prevents words from being cut off at chunk boundaries. "
+            "Higher values give more context but increase total audio volume "
+            "(and API cost for Groq). (default: 5)"
+        ),
+    )
+    parser.add_argument(
+        "--size-mb",
+        type=float,
+        default=10,
+        help=(
+            "Maximum chunk file size in MiB for the split stage. Audio is split "
+            "into chunks no larger than this to stay within transcription API "
+            "limits. Smaller chunks give more granular progress but increase the "
+            "number of API calls. (default: 10)"
+        ),
+    )
+    parser.add_argument(
+        "-j", "--threads",
+        type=int,
+        default=0,
+        help=(
+            "Number of parallel worker threads for ffmpeg-heavy stages "
+            "(normalize, enhance, convert, split). 0 means use all available "
+            "CPU cores. Set lower on shared machines or when bandwidth/I/O is "
+            "the bottleneck. (default: 0)"
+        ),
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["groq", "local"],
+        default="groq",
+        help=(
+            "Transcription backend to use. 'groq' sends chunks to the Groq cloud "
+            "API (requires GROQ_API_KEY in .env, fast, paid). 'local' runs ONNX "
+            "models offline via onnx-asr (requires model download on first use, "
+            "slower, free). (default: groq)"
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Model name for the chosen engine. For --engine groq: any "
+            "Groq-supported model (e.g. distil-whisper-large-v3-en, "
+            "whisper-large-v3). For --engine local: an ONNX model name "
+            "discovered from Handy.app's models directory. If omitted, the "
+            "engine's default model is used. (default: engine default model)"
+        ),
+    )
+    parser.add_argument(
+        "--language",
+        default=None,
+        help=(
+            "ISO 639-1 language code (e.g. en, es, fr, de) hinting the "
+            "transcription engine. Improves accuracy and speed when the language "
+            "is known. If omitted, the engine auto-detects the language. "
+            "(default: auto-detect)"
+        ),
+    )
+    parser.add_argument(
+        "--diarize",
+        action="store_true",
+        default=False,
+        help=(
+            "Run speaker diarization after transcription (local engine only, "
+            "ignored for Groq). Identifies and labels different speakers in the "
+            "audio. Requires HF_TOKEN in .env for pyannote model access. Adds "
+            "significant processing time. Results are cached alongside the "
+            "transcript. (default: false)"
+        ),
+    )
+    parser.add_argument(
+        "--num-speakers",
+        type=int,
+        default=None,
+        help=(
+            "Number of distinct speakers expected in the audio (local engine + "
+            "diarize only). Helps the diarization model converge faster and more "
+            "accurately. If omitted, the model estimates the count automatically. "
+            "Has no effect without --diarize. (default: auto-estimate)"
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help=(
+            "Re-run every pipeline stage from scratch, ignoring any cached "
+            "intermediate or output files. Equivalent to deleting "
+            "<output>/intermediates/ and all chunks before running. Use when you "
+            "changed settings and need a clean pass. (default: false)"
+        ),
+    )
+    parser.add_argument(
+        "-c", "--continue",
+        action="store_true",
+        dest="continue_run",
+        help=(
+            "Allow the pipeline to run into an output directory that already "
+            "contains files. Without this flag, the script exits with an error "
+            "if the output dir is non-empty. Combined with caching, this lets "
+            "you resume a failed run without re-computing completed stages. "
+            "(default: false)"
+        ),
+    )
 
     args = parser.parse_args()
     logger = setup_logging(args.v)
+
+    if not validate_args(args, logger):
+        return 1
 
     try:
         input_path = args.input.resolve()
