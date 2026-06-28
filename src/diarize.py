@@ -180,20 +180,23 @@ def get_speaker_samples(
     segments: list[dict],
     max_samples: int = 3,
 ) -> tuple[dict[str, list[dict]], dict[str, int]]:
-    """Group segments by speaker, return up to 3 random samples and counts.
+    """Group segments by speaker, return the best samples for labeling.
 
-    Each sample is a dict with 'text', 'start', 'end' so the caller can
-    show timestamps for the interactive labeling prompt.
+    Prefers long, substantive segments (>=2s duration, >=10 chars text)
+    so the user can clearly hear and identify each speaker's voice.
+    Falls back to shorter segments if not enough long ones exist.
+
+    Returns (samples_by_speaker, segment_counts).
     """
     from collections import defaultdict
 
-    all_samples: dict[str, list[dict]] = defaultdict(list)
+    all_segs: dict[str, list[dict]] = defaultdict(list)
     counts: dict[str, int] = defaultdict(int)
 
     for seg in segments:
         speaker = seg["speaker"]
         counts[speaker] += 1
-        all_samples[speaker].append(
+        all_segs[speaker].append(
             {
                 "text": seg["text"],
                 "start": seg["start"],
@@ -202,9 +205,21 @@ def get_speaker_samples(
         )
 
     picked: dict[str, list[dict]] = {}
-    for speaker, segs in all_samples.items():
-        n = min(max_samples, len(segs))
-        picked[speaker] = random.sample(segs, n)
+    for speaker, segs in all_segs.items():
+        # Prefer long segments with substantive text
+        substantive = [
+            s for s in segs if (s["end"] - s["start"]) >= 2.0 and len(s["text"].strip()) >= 10
+        ]
+        # Sort by duration descending — longest segments are clearest for ID
+        substantive.sort(key=lambda s: s["end"] - s["start"], reverse=True)
+
+        if len(substantive) >= max_samples:
+            picked[speaker] = substantive[:max_samples]
+        else:
+            # Use all substantive, fill remaining with shorter ones
+            remaining = [s for s in segs if s not in substantive]
+            remaining.sort(key=lambda s: s["end"] - s["start"], reverse=True)
+            picked[speaker] = (substantive + remaining)[:max_samples]
 
     return picked, dict(counts)
 
