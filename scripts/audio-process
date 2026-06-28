@@ -12,9 +12,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.logging import setup_logging
 from src.config import load_env
+from src.diarize import load_speaker_mapping
 from src.local_transcribe import resolve_model
+from src.logging import setup_logging
 
 
 def run_script(script: str, args: list, logger, threads: int = 0) -> subprocess.CompletedProcess:
@@ -307,18 +308,6 @@ pipeline stages:
         logger.info("Starting audio processing pipeline")
         logger.info("=" * 50)
 
-        # Fast resume: if transcription already exists and not forcing, skip everything
-        transcription_path = output_dir / "transcription.srt"
-        if transcription_path.exists() and not args.force:
-            chunk_files = sorted((output_dir / "chunks").glob("*")) if (output_dir / "chunks").exists() else []
-            logger.info("Transcription already exists, skipping all stages.")
-            logger.info("=" * 50)
-            logger.info("Pipeline complete!")
-            logger.info(f"  Output: {output_dir}")
-            logger.info(f"  Chunks: {len(chunk_files)}")
-            logger.info(f"  Transcript: {transcription_path}")
-            return 0
-
         # Stage 1: Normalize
         norm_out = inter_dir / "normalized.wav"
         if norm_out.exists() and not args.force:
@@ -392,7 +381,15 @@ pipeline stages:
             logger.info(f"  -> Created {len(chunk_files)} chunks in {split_dir}")
 
         # Stage 5: Transcribe
-        if transcription_path.exists() and not args.force:
+        transcription_path = output_dir / "transcription.srt"
+        speakers_path = transcription_path.with_suffix(".speakers.json")
+        diarize_done = False
+        if args.diarize and speakers_path.exists():
+            result = load_speaker_mapping(speakers_path)
+            if result is not None:
+                _, diarize_done = result
+
+        if transcription_path.exists() and not (args.force or (args.diarize and not diarize_done)):
             logger.info(f"[5/5] Transcribe: cached ({transcription_path.name})")
         else:
             logger.info("[5/5] Transcribing...")
