@@ -9,7 +9,7 @@ Offline speech-to-text pipeline with speaker diarization. Transcribes audio loca
 - **VAD segmentation** — Silero VAD with configurable speech duration
 - **Session resume** — Every stage cached (transcription, diarization, WAV, speaker labels)
 - **Audio preprocessing** — Loudness normalization, voice enhancement, format conversion, chunking
-- **SRT output** — Subtitle files with optional speaker prefixes (`Speaker Johnny: ...`)
+- **SRT output** — Subtitle files with optional speaker prefixes (`[<speaker>]: ...`)
 - **Groq API** — Optional cloud transcription via `--engine groq`
 
 ## Prerequisites
@@ -24,7 +24,7 @@ Offline speech-to-text pipeline with speaker diarization. Transcribes audio loca
 ```bash
 uv venv
 source .venv/bin/activate
-uv pip install pydub python-dotenv "onnx-asr[cpu,hub]" pyannote-audio
+uv pip install pydub python-dotenv groq "onnx-asr[cpu,hub]" pyannote-audio
 
 cp .env.example .env
 # Edit .env: add HF_TOKEN=hf_xxx (and GROQ_API_KEY if using cloud)
@@ -40,6 +40,10 @@ python scripts/audio-process -i meeting.m4a -o output/ --engine local --model pa
 python scripts/audio-process -i meeting.m4a -o output/ --engine local -c -vvv
 
 # With speaker diarization (interactive, requires terminal)
+# Preferred: use audio-process with --diarize
+python scripts/audio-process -i meeting.m4a -o output/ --engine local --diarize -vvv
+
+# Or standalone: audio-transcribe-local with --diarize
 python scripts/audio-transcribe-local -i output/chunks -o output/transcription.srt \
   --model parakeet --diarize -vvv
 
@@ -53,8 +57,7 @@ python scripts/audio-process -i meeting.m4a -o output/ --engine groq -vvv
 2. `audio-enhance` — High-pass/low-pass voice filters (ffmpeg)
 3. `audio-convert` — Convert to 16kHz mono Opus
 4. `audio-split` — Split by size with overlap
-5. `audio-transcribe-local` (or `audio-transcribe` for Groq) — Transcribe chunks
-6. `diarize` — Optional speaker labeling via pyannote-audio
+5. `audio-transcribe-local` (or `audio-transcribe` for Groq) — Transcribe chunks (with optional `--diarize` for speaker labeling)
 
 Output: `transcription.srt` + `.speakers.json` + `.diarization.json` + `.diarize.wav` (all cached for re-runs)
 
@@ -81,6 +84,10 @@ python scripts/audio-transcribe -i chunks/ -o output.srt -vvv  # Groq
 | `--force` | Re-run all stages ignoring cache |
 | `--keep-temp` | Keep intermediate files |
 | `-v, -vv, -vvv` | Verbosity levels |
+| `--language` | ISO 639-1 language code hint (e.g. `en`, `es`). Auto-detects if omitted. |
+| `-j, --threads` | Parallel worker threads. 0 = all cores (default: 0). |
+| `--overlap` | Chunk overlap in seconds (default: 5). |
+| `--size-mb` | Max chunk size in MiB (default: 10). |
 
 ## Environment Variables
 

@@ -10,7 +10,7 @@ source .venv/bin/activate
 uv pip install <package>
 ```
 
-Required: `ffmpeg` (system), `pydub`, `python-dotenv`, `onnx-asr[cpu,hub]`, `pyannote-audio`
+Required: `ffmpeg` (system), `pydub`, `python-dotenv`, `groq`, `onnx-asr[cpu,hub]`, `pyannote-audio`
 
 ---
 
@@ -20,7 +20,7 @@ Required: `ffmpeg` (system), `pydub`, `python-dotenv`, `onnx-asr[cpu,hub]`, `pya
 ```bash
 uv venv
 source .venv/bin/activate
-uv pip install pydub python-dotenv "onnx-asr[cpu,hub]" pyannote-audio
+uv pip install pydub python-dotenv groq "onnx-asr[cpu,hub]" pyannote-audio
 ```
 
 ### Running Scripts
@@ -38,7 +38,7 @@ ruff check --fix .
 
 ## File Structure
 ```
-local-sst/
+groq-stt/
 ├── src/
 │   ├── __init__.py
 │   ├── audio.py           # Audio loading utilities
@@ -58,6 +58,7 @@ local-sst/
 │   └── audio-process           # Full pipeline orchestrator
 ├── .env.example
 ├── pyproject.toml
+├── README.md
 └── AGENTS.md
 ```
 

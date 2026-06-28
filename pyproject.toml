@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "pydub",
     "python-dotenv",
+    "groq",
     "onnx-asr[cpu,hub]",
     "pyannote-audio",
 ]
