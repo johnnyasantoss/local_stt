@@ -112,4 +112,6 @@ python scripts/audio-transcribe-local -i dummy -o dummy
 
 ## License
 
-MIT
+Dual-licensed under the Unlicense OR the MIT License, at your option
+(see `UNLICENSE` and `LICENSE`). Contributions are accepted under the
+same dual-license terms.

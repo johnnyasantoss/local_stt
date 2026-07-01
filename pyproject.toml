@@ -2,7 +2,12 @@
 name = "local-sst"
 version = "0.1.0"
 description = "Offline speech-to-text pipeline with speaker diarization"
+license = "Unlicense OR MIT"
 requires-python = ">=3.11"
+classifiers = [
+    "License :: OSI Approved :: The Unlicense",
+    "License :: OSI Approved :: MIT License",
+]
 dependencies = [
     "pydub",
     "python-dotenv",
