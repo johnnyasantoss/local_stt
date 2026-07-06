@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Transcribe audio files locally using ONNX models from Handy.app."""
+"""Transcribe audio files locally using transcribe.cpp (Handy Computer's ggml STT engine).
+
+transcribe.cpp is the new Handy Computer release that replaces the previous
+ONNX transcription path. It runs GGUF models on Metal/Vulkan/CUDA/CPU and is
+substantially faster than ONNX on the same hardware.
+"""
 
 import sys
 from pathlib import Path
@@ -10,7 +15,7 @@ from dotenv import load_dotenv
 
 from src.local_transcribe import discover_models, transcribe_local
 from src.logging import add_verbose_arg, setup_logging
-from src.srt import segments_to_srt, parse_srt
+from src.srt import parse_srt, segments_to_srt
 
 load_dotenv()
 
@@ -42,20 +47,23 @@ def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Transcribe audio locally using ONNX models from Handy.app"
+        description="Transcribe audio locally using transcribe.cpp (Handy Computer ggml STT)"
     )
     add_verbose_arg(parser)
-    parser.add_argument("-i", "--input", type=Path, required=True,
+    parser.add_argument("--list-models", action="store_true",
+                        help="List available handy-computer GGUF models and exit")
+    pre, _ = parser.parse_known_args()
+    list_only = getattr(pre, "list_models", False)
+
+    parser.add_argument("-i", "--input", type=Path, required=not list_only,
                         help="Input audio file or directory of chunks")
-    parser.add_argument("-o", "--output", type=Path, required=True,
+    parser.add_argument("-o", "--output", type=Path, required=not list_only,
                         help="Output .srt file")
     parser.add_argument("-m", "--model", default=None,
-                        help="Model name or path (fuzzy matched). "
-                             "If omitted, lists available models.")
+                        help="GGUF model path or HF cache short name. "
+                             "Default: whisper-large-v3-turbo Q8_0.")
     parser.add_argument("-l", "--language",
-                        help="Language code (e.g., en). Required for Canary.")
-    parser.add_argument("--vad-threshold", type=float, default=0.5,
-                        help="VAD speech detection threshold (default: 0.5)")
+                        help="ISO 639-1 two-letter code (e.g., en, pt). Regional variants like pt-BR are not accepted; use the base code. None = auto-detect.")
     parser.add_argument("--overlap-secs", type=float, default=5.0,
                         help="Overlap seconds for chunk merging (default: 5)")
     parser.add_argument("-j", "--parallel", type=int, default=4,
@@ -70,14 +78,17 @@ def main() -> int:
     args = parser.parse_args()
     logger = setup_logging(args.v)
 
-    if args.model is None:
+    if args.list_models:
         models = discover_models()
         if not models:
-            logger.error("No supported models found in Handy models directory")
+            logger.error(
+                "No GGUF models found in HuggingFace cache "
+                "(~/.cache/huggingface/hub/models--handy-computer--*-gguf)."
+            )
             return 1
-        print("Available models:")
+        print("Available handy-computer GGUF models:")
         for m in models:
-            print(f"  {m['name']:30s}  {m['model_type']:25s}  {m['size_mb']:.0f} MB")
+            print(f"  {m['name']:30s}  {m['quant']:8s}  {m['size_mb']:.0f} MB")
         return 0
 
     try:
@@ -90,7 +101,6 @@ def main() -> int:
                 input_path=args.input,
                 model_query=args.model,
                 language=args.language,
-                vad_threshold=args.vad_threshold,
                 overlap_secs=args.overlap_secs,
                 parallel=args.parallel,
                 logger=logger,

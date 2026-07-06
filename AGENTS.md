@@ -1,7 +1,7 @@
 # AGENTS.md - Agent Guidelines for Local-SST Project
 
 ## Project Overview
-Audio preprocessing pipeline for transcription using local ONNX models (Parakeet, Canary) from Handy.app, with optional Groq cloud API. Focus on Unix philosophy: one focus per script, stdio for piping, minimal dependencies.
+Audio preprocessing pipeline for transcription using transcribe.cpp (Handy Computer's ggml STT engine) for local inference, with optional Groq cloud API. Focus on Unix philosophy: one focus per script, stdio for piping, minimal dependencies.
 
 ## Dependencies
 All Python packages must be installed via `uv`:
@@ -10,7 +10,7 @@ source .venv/bin/activate
 uv pip install <package>
 ```
 
-Required: `ffmpeg` (system), `pydub`, `python-dotenv`, `groq`, `onnx-asr[cpu,hub]`, `pyannote-audio`
+Required: `ffmpeg` (system), `pydub`, `python-dotenv`, `groq`, `pyannote-audio`. Local engine requires a built transcribe.cpp (`../transcribe.cpp/build/bin/transcribe-cli`); override via `TRANSCRIBE_CLI` env.
 
 ---
 
@@ -20,7 +20,7 @@ Required: `ffmpeg` (system), `pydub`, `python-dotenv`, `groq`, `onnx-asr[cpu,hub
 ```bash
 uv venv
 source .venv/bin/activate
-uv pip install pydub python-dotenv groq "onnx-asr[cpu,hub]" pyannote-audio
+uv pip install pydub python-dotenv groq pyannote-audio
 ```
 
 ### Running Scripts
@@ -46,7 +46,7 @@ groq-stt/
 │   ├── config.py          # Environment/config helpers
 │   ├── srt.py             # SRT/VTT generation + parsing
 │   ├── transcribe.py      # Groq cloud transcription
-│   ├── local_transcribe.py # Local ONNX transcription engine
+│   ├── local_transcribe.py # Local transcribe.cpp (ggml) engine
 │   └── diarize.py         # Speaker diarization (pyannote)
 ├── scripts/
 │   ├── audio-normalize
@@ -54,7 +54,7 @@ groq-stt/
 │   ├── audio-convert
 │   ├── audio-split
 │   ├── audio-transcribe       # Groq cloud
-│   ├── audio-transcribe-local  # Local ONNX
+│   ├── audio-transcribe-local  # Local transcribe.cpp
 │   └── audio-process           # Full pipeline orchestrator
 ├── .env.example
 ├── pyproject.toml
@@ -81,7 +81,7 @@ groq-stt/
 ### Audio Processing
 - **Do not load entire large audio files into memory** for duration/metadata. Use `ffprobe` or read headers only. Loading a 5-hour file into pydub consumes 20GB+ RAM.
 - **Use ffmpeg subprocess directly** for filter operations (highpass, lowpass, loudnorm) on large files. pydub's in-memory filters crash on files >1 hour.
-- **Convert compressed formats to 16kHz mono WAV** before passing to ONNX or pyannote. Compressed formats (Opus, MP3) have imprecise sample counts that cause chunking errors.
+- **Convert compressed formats to 16kHz mono WAV** before passing to transcribe-cli or pyannote. Compressed formats (Opus, MP3) have imprecise sample counts that cause chunking errors.
 
 ### Pipeline
 - **Cache pipeline intermediates** between stages. Allow `--continue/-c` to resume a failed run without re-computing completed stages. Do not re-run a 5-minute normalize step because the script crashed at transcription.
@@ -93,8 +93,8 @@ groq-stt/
 - **Handle `KeyboardInterrupt` in interactive prompts.** Save partial progress, write output, and exit cleanly. Users must be able to resume from where they stopped.
 
 ### Transcription
-- **Default engine is `groq`** (cloud). Use `--engine local` for offline ONNX transcription with Parakeet/Canary models.
-- Models are auto-discovered from Handy.app's models directory on every run (lazy scan).
+- **Default engine is `groq`** (cloud). Use `--engine local` for offline transcription via transcribe.cpp (whisper-large-v3-turbo by default).
+- GGUF models are auto-discovered from the HuggingFace cache (`~/.cache/huggingface/hub/models--handy-computer--*-gguf`) on every run; override model with `-m` or `TCPP_MODEL` env, binary with `TRANSCRIBE_CLI` env. See https://huggingface.co/handy-computer for model details.
 - Diarization caches: WAV conversion (`*.diarize.wav`), diarization results (`*.diarization.json`), speaker labels (`*.speakers.json`). All three are persisted and reused on re-runs.
 
 ---
