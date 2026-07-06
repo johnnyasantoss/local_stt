@@ -14,7 +14,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.config import load_env
 from src.diarize import load_speaker_mapping
-from src.local_transcribe import resolve_model
 from src.logging import setup_logging
 
 
@@ -71,13 +70,14 @@ def validate_args(args, logger) -> bool:
             valid = False
 
     if args.engine == "local":
-        # Validate model early if provided
-        if args.model:
-            try:
-                resolve_model(args.model)
-            except ValueError as e:
-                logger.error(str(e))
-                valid = False
+        # Validate transcribe-cli binary + GGUF model early (fail fast).
+        from src.local_transcribe import resolve_cli, resolve_model
+        try:
+            resolve_cli()
+            resolve_model(args.model)
+        except FileNotFoundError as e:
+            logger.error(str(e))
+            valid = False
 
         # HF_TOKEN required if diarize requested
         if args.diarize:
@@ -114,7 +114,7 @@ pipeline stages:
   2. Enhance     - voice band isolation (highpass/lowpass)
   3. Convert     - resample to 16kHz mono Opus
   4. Split       - chunk by size with overlap
-  5. Transcribe  - Groq cloud or local ONNX model
+  5. Transcribe  - Groq cloud or local transcribe.cpp (ggml)
 """
 
     parser = argparse.ArgumentParser(
@@ -208,9 +208,9 @@ pipeline stages:
         default="groq",
         help=(
             "Transcription backend to use. 'groq' sends chunks to the Groq cloud "
-            "API (requires GROQ_API_KEY in .env, fast, paid). 'local' runs ONNX "
-            "models offline via onnx-asr (requires model download on first use, "
-            "slower, free). (default: groq)"
+            "API (requires GROQ_API_KEY in .env, fast, paid). 'local' runs transcribe.cpp "
+            "(Handy Computer's ggml STT) offline via a built binary; default model "
+            "whisper-large-v3-turbo. Free. (default: groq)"
         ),
     )
     parser.add_argument(
@@ -219,8 +219,10 @@ pipeline stages:
         help=(
             "Model name for the chosen engine. For --engine groq: any "
             "Groq-supported model (e.g. distil-whisper-large-v3-en, "
-            "whisper-large-v3). For --engine local: an ONNX model name "
-            "discovered from Handy.app's models directory. If omitted, the "
+            "whisper-large-v3). For --engine local: a GGUF path or HF cache short "
+            "name (defaults to whisper-large-v3-turbo Q8_0); use "
+            "`scripts/audio-transcribe-local --list-models` to list cached handy-computer "
+            "GGUFs. If omitted, the "
             "engine's default model is used. (default: engine default model)"
         ),
     )
@@ -228,8 +230,9 @@ pipeline stages:
         "--language",
         default=None,
         help=(
-            "ISO 639-1 language code (e.g. en, es, fr, de) hinting the "
-            "transcription engine. Improves accuracy and speed when the language "
+            "ISO 639-1 two-letter code (e.g. en, es, fr, pt) hinting the "
+            "transcription engine. Regional variants like pt-BR are not supported; "
+            "use the base code (pt). Improves accuracy and speed when the language "
             "is known. If omitted, the engine auto-detects the language. "
             "(default: auto-detect)"
         ),
@@ -422,7 +425,7 @@ pipeline stages:
                 result = run_script("audio-transcribe", trans_args, logger)
 
             if result.returncode != 0:
-                logger.error(f"transcribe failed: {result.stderr}")
+                logger.error("transcribe failed (see log above)")
                 return 1
             logger.info(f"  -> {transcription_path}")
 
