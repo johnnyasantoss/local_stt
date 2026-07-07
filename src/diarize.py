@@ -122,19 +122,33 @@ def diarize_audio(
         elif cache_dir is not None and logger and wav_path.exists():
             logger.info(f"Using cached WAV: {wav_path}")
 
-        result = pipeline(str(wav_path), **kwargs)
-
-        # pyannote 4.x returns DiarizeOutput, older versions return Annotation directly
+        # Build kwargs explicitly so pyright can narrow the types (avoids int/float vs bool mismatch).
+        _pipeline_kwargs: dict = {}
+        if kwargs.get("num_speakers") is not None:
+            _pipeline_kwargs["num_speakers"] = kwargs["num_speakers"]
+        elif kwargs.get("min_speakers") is not None:
+            _pipeline_kwargs["min_speakers"] = kwargs["min_speakers"]
+            _pipeline_kwargs["max_speakers"] = kwargs["max_speakers"]
+        result = pipeline(str(wav_path), **_pipeline_kwargs)  # type: ignore[arg-type]
         if hasattr(result, "speaker_diarization"):
-            annotation = result.speaker_diarization
+            annotation = result.speaker_diarization  # type: ignore[union-attr]
         else:
             annotation = result
+            assert hasattr(annotation, "itertracks"), (
+                "Expected pyannote Annotation or DiarizationOutput"
+            )
     finally:
         if tmp_dir is not None:
             tmp_dir.cleanup()
 
     segments = []
-    for turn, _, speaker in annotation.itertracks(yield_label=True):
+    # Guard against pyannote versions that do not expose itertracks (e.g. DiarizationOutput).
+    if hasattr(annotation, "itertracks"):
+        it = annotation.itertracks(yield_label=True)  # type: ignore[call-non-callable]
+    else:
+        it = []
+
+    for turn, _, speaker in it:
         segments.append(
             {
                 "start": turn.start,

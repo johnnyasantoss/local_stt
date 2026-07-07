@@ -165,6 +165,7 @@ def _run_cli(
     )
 
     results = []
+    assert proc.stdout is not None, "Popen stdout must be iterable (PIPE mode)"
     for line in proc.stdout:
         line = line.rstrip()
         if not line:
@@ -260,6 +261,8 @@ def transcribe_local(
         return _transcribe_single_file(cli, model, input_path, language, logger)
     elif input_path.is_dir():
         return _transcribe_directory(cli, model, input_path, language, overlap_secs, logger)
+    else:
+        raise ValueError(f"Input path is neither a file nor directory: {input_path}")
 
 
 def _transcribe_single_file(
