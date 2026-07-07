@@ -50,30 +50,60 @@ def main() -> int:
         description="Transcribe audio locally using transcribe.cpp (Handy Computer ggml STT)"
     )
     add_verbose_arg(parser)
-    parser.add_argument("--list-models", action="store_true",
-                        help="List available handy-computer GGUF models and exit")
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="List available handy-computer GGUF models and exit",
+    )
     pre, _ = parser.parse_known_args()
     list_only = getattr(pre, "list_models", False)
 
-    parser.add_argument("-i", "--input", type=Path, required=not list_only,
-                        help="Input audio file or directory of chunks")
-    parser.add_argument("-o", "--output", type=Path, required=not list_only,
-                        help="Output .srt file")
-    parser.add_argument("-m", "--model", default=None,
-                        help="GGUF model path or HF cache short name. "
-                             "Default: whisper-large-v3-turbo Q8_0.")
-    parser.add_argument("-l", "--language",
-                        help="ISO 639-1 two-letter code (e.g., en, pt). Regional variants like pt-BR are not accepted; use the base code. None = auto-detect.")
-    parser.add_argument("--overlap-secs", type=float, default=5.0,
-                        help="Overlap seconds for chunk merging (default: 5)")
-    parser.add_argument("-j", "--parallel", type=int, default=4,
-                        help="Parallel workers for chunk directory (default: 4)")
-    parser.add_argument("--diarize", action="store_true",
-                        help="Run speaker diarization and label speakers")
-    parser.add_argument("--num-speakers", type=int, default=None,
-                        help="Known number of speakers (optional)")
-    parser.add_argument("--speakers-file", type=Path, default=None,
-                        help="Path to .speakers.json mapping (skip interactive prompt)")
+    parser.add_argument(
+        "-i",
+        "--input",
+        type=Path,
+        required=not list_only,
+        help="Input audio file or directory of chunks",
+    )
+    parser.add_argument(
+        "-o", "--output", type=Path, required=not list_only, help="Output .srt file"
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        default=None,
+        help="GGUF model path or HF cache short name. Default: whisper-large-v3-turbo Q8_0.",
+    )
+    parser.add_argument(
+        "-l",
+        "--language",
+        help="ISO 639-1 two-letter code (e.g., en, pt). Regional variants like pt-BR are not accepted; use the base code. None = auto-detect.",
+    )
+    parser.add_argument(
+        "--overlap-secs",
+        type=float,
+        default=5.0,
+        help="Overlap seconds for chunk merging (default: 5)",
+    )
+    parser.add_argument(
+        "-j",
+        "--parallel",
+        type=int,
+        default=4,
+        help="Parallel workers for chunk directory (default: 4)",
+    )
+    parser.add_argument(
+        "--diarize", action="store_true", help="Run speaker diarization and label speakers"
+    )
+    parser.add_argument(
+        "--num-speakers", type=int, default=None, help="Known number of speakers (optional)"
+    )
+    parser.add_argument(
+        "--speakers-file",
+        type=Path,
+        default=None,
+        help="Path to .speakers.json mapping (skip interactive prompt)",
+    )
 
     args = parser.parse_args()
     logger = setup_logging(args.v)
@@ -120,6 +150,7 @@ def main() -> int:
                 return 1
 
             from src.diarize import (
+                _ensure_wav,
                 apply_speaker_labels,
                 assign_speakers_to_segments,
                 diarize_audio,
@@ -149,9 +180,7 @@ def main() -> int:
             diar_cache_path = args.output.with_suffix(".diarization.json")
             if diar_cache_path.exists():
                 logger.info(f"Loading cached diarization: {diar_cache_path}")
-                diarization_segments = json.loads(
-                    diar_cache_path.read_text(encoding="utf-8")
-                )
+                diarization_segments = json.loads(diar_cache_path.read_text(encoding="utf-8"))
                 logger.info(f"Loaded {len(diarization_segments)} diarization segments")
             else:
                 diarization_segments = diarize_audio(
@@ -172,9 +201,12 @@ def main() -> int:
                 logger.info("Using finalized speaker labels (skipping prompt)")
             else:
                 # Prompt for speaker labels (shows saved labels as defaults)
-                samples, counts = get_speaker_samples(segments)
+                samples, _ = get_speaker_samples(segments)
+                # Locate the cached diarize WAV for audio playback (or skip if unavailable).
+                full_audio = _find_full_audio(args.input)
+                _, wav_path = _ensure_wav(full_audio, cache_dir=args.output.parent)
                 speaker_labels, speaker_finalized = prompt_speaker_labels(
-                    samples, counts, existing_labels=speaker_labels
+                    samples, diarization_segments, wav_path=wav_path, existing_labels=speaker_labels
                 )
 
             sp_path = args.output.with_suffix(".speakers.json")
