@@ -17,39 +17,48 @@ from src.transcribe import (
 
 def main() -> int:
     import argparse
-    
-    parser = argparse.ArgumentParser(
-        description="Transcribe audio using Groq Whisper API"
-    )
+
+    parser = argparse.ArgumentParser(description="Transcribe audio using Groq Whisper API")
     add_verbose_arg(parser)
-    parser.add_argument("-i", "--input", type=Path, required=True,
-                        help="Input audio file or directory of chunks")
-    parser.add_argument("-o", "--output", type=Path, required=True,
-                        help="Output .srt file")
-    parser.add_argument("-m", "--model", default="whisper-large-v3-turbo",
-                        help=f"Whisper model (default: whisper-large-v3-turbo)")
-    parser.add_argument("-l", "--language",
-                        help="Language code (e.g., en)")
-    parser.add_argument("-j", "--parallel", type=int, default=4,
-                        help="Parallel API calls (default: 4)")
-    parser.add_argument("--fail-fast", action="store_true",
-                        help="Stop on first error")
-    parser.add_argument("--overlap-secs", type=float, default=5.0,
-                        help="Overlap seconds used when splitting (default: 5)")
-    parser.add_argument("--chunk-duration", type=float, default=600.0,
-                        help="Chunk duration in seconds (default: 600)")
-    
+    parser.add_argument(
+        "-i", "--input", type=Path, required=True, help="Input audio file or directory of chunks"
+    )
+    parser.add_argument("-o", "--output", type=Path, required=True, help="Output .srt file")
+    parser.add_argument(
+        "-m",
+        "--model",
+        default="whisper-large-v3-turbo",
+        help=f"Whisper model (default: whisper-large-v3-turbo)",
+    )
+    parser.add_argument("-l", "--language", help="Language code (e.g., en)")
+    parser.add_argument(
+        "-j", "--parallel", type=int, default=4, help="Parallel API calls (default: 4)"
+    )
+    parser.add_argument("--fail-fast", action="store_true", help="Stop on first error")
+    parser.add_argument(
+        "--overlap-secs",
+        type=float,
+        default=5.0,
+        help="Overlap seconds used when splitting (default: 5)",
+    )
+    parser.add_argument(
+        "--chunk-duration",
+        type=float,
+        default=600.0,
+        help="Chunk duration in seconds (default: 600)",
+    )
+
     args = parser.parse_args()
     logger = setup_logging(args.v)
-    
+
     load_env()
     require_env("GROQ_API_KEY")
-    
+
     input_path = args.input
     if not input_path.exists():
         logger.error(f"Input not found: {input_path}")
         return 1
-    
+
     if input_path.is_file():
         size_mb = input_path.stat().st_size / (1024 * 1024)
         if size_mb > MAX_FILE_SIZE_MB:
@@ -58,7 +67,7 @@ def main() -> int:
                 "Use audio-split first, then pass the directory."
             )
             return 1
-    
+
     try:
         fail_fast = args.fail_fast or args.parallel == 1
         output_path = transcribe_audio(
@@ -74,7 +83,7 @@ def main() -> int:
         )
         print(str(output_path))
         return 0
-    
+
     except TranscriptionError as e:
         logger.error(f"Transcription error: {e}")
         return 1

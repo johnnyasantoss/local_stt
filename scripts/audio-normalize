@@ -30,10 +30,14 @@ def normalize_loudness(
     cmd = [
         "ffmpeg",
         "-hide_banner",
-        "-loglevel", "warning",
-        "-threads", str(threads) if threads > 0 else str(os.cpu_count() or 1),
-        "-i", str(input_path),
-        "-af", f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11",
+        "-loglevel",
+        "warning",
+        "-threads",
+        str(threads) if threads > 0 else str(os.cpu_count() or 1),
+        "-i",
+        str(input_path),
+        "-af",
+        f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11",
         "-y",
         str(output_path),
     ]
@@ -49,8 +53,7 @@ def main() -> int:
         "--target-lufs", type=float, default=-16.0, help="Target loudness in LUFS (default: -16)"
     )
     parser.add_argument(
-        "-j", "--threads", type=int, default=0,
-        help="Number of threads (0 = all cores, default: 0)"
+        "-j", "--threads", type=int, default=0, help="Number of threads (0 = all cores, default: 0)"
     )
 
     args = parser.parse_args()
@@ -62,7 +65,9 @@ def main() -> int:
 
         audio = load_audio(input_path)
         info = get_audio_info(audio)
-        logger.info(f"Audio: {info['duration_seconds']:.1f}s, {info['channels']}ch, {info['sample_rate']}Hz")
+        logger.info(
+            f"Audio: {info['duration_seconds']:.1f}s, {info['channels']}ch, {info['sample_rate']}Hz"
+        )
 
         output_path = resolve_output_path(args.output, input_path, "wav")
         output_path.parent.mkdir(parents=True, exist_ok=True)

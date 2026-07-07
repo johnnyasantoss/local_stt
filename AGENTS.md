@@ -7,7 +7,7 @@ Audio preprocessing pipeline for transcription using transcribe.cpp (Handy Compu
 All Python packages must be installed via `uv`:
 ```bash
 source .venv/bin/activate
-uv pip install <package>
+uv add <package>
 ```
 
 Required: `ffmpeg` (system), `pydub`, `python-dotenv`, `groq`, `pyannote-audio`. Local engine requires a built transcribe.cpp (`../transcribe.cpp/build/bin/transcribe-cli`); override via `TRANSCRIBE_CLI` env.
@@ -18,9 +18,9 @@ Required: `ffmpeg` (system), `pydub`, `python-dotenv`, `groq`, `pyannote-audio`.
 
 ### Environment Setup
 ```bash
+uv sync
 uv venv
 source .venv/bin/activate
-uv pip install pydub python-dotenv groq pyannote-audio
 ```
 
 ### Running Scripts
@@ -32,13 +32,16 @@ python scripts/<script-name> --input audio.m4a --output ./out -vvv
 ```bash
 ruff check .
 ruff check --fix .
+
+# and
+just lint
 ```
 
 ---
 
 ## File Structure
 ```
-groq-stt/
+local-sst/
 ├── src/
 │   ├── __init__.py
 │   ├── audio.py           # Audio loading utilities
@@ -111,3 +114,4 @@ groq-stt/
 
 ## Agent Rules
 - NEVER read `.env` or secret files
+- Always make sure your code lints/checks properly BEFORE submitting it to user

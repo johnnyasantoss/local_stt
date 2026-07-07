@@ -25,10 +25,14 @@ def enhance_audio(
     cmd = [
         "ffmpeg",
         "-hide_banner",
-        "-loglevel", "warning",
-        "-threads", str(threads) if threads > 0 else str(os.cpu_count() or 1),
-        "-i", str(input_path),
-        "-af", f"highpass=f={high_pass},lowpass=f={low_pass}",
+        "-loglevel",
+        "warning",
+        "-threads",
+        str(threads) if threads > 0 else str(os.cpu_count() or 1),
+        "-i",
+        str(input_path),
+        "-af",
+        f"highpass=f={high_pass},lowpass=f={low_pass}",
         "-y",
         str(output_path),
     ]
@@ -44,8 +48,7 @@ def main() -> int:
     parser.add_argument("--low-pass", type=int, default=8000, help="Low-pass Hz (default: 8000)")
     parser.add_argument("--format", default="wav", help="Output format (default: wav)")
     parser.add_argument(
-        "-j", "--threads", type=int, default=0,
-        help="Number of threads (0 = all cores, default: 0)"
+        "-j", "--threads", type=int, default=0, help="Number of threads (0 = all cores, default: 0)"
     )
 
     args = parser.parse_args()
@@ -57,7 +60,9 @@ def main() -> int:
 
         audio = load_audio(input_path)
         info = get_audio_info(audio)
-        logger.info(f"Audio: {info['duration_seconds']:.1f}s, {info['channels']}ch, {info['sample_rate']}Hz")
+        logger.info(
+            f"Audio: {info['duration_seconds']:.1f}s, {info['channels']}ch, {info['sample_rate']}Hz"
+        )
 
         logger.info(f"Applying filters: high-pass {args.high_pass}Hz, low-pass {args.low_pass}Hz")
         output_path = resolve_output_path(args.output, input_path, args.format)

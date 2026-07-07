@@ -93,14 +93,17 @@ def transcribe_chunk(
             response = client.audio.transcriptions.create(
                 file=(chunk_path.name, f.read()),
                 model=model,
-                language=language,
+                **({"language": language} if language else {}),
                 response_format="verbose_json",
                 timestamp_granularities=["segment"],
             )
 
         segments = []
+        segments = []
         if hasattr(response, "segments") and response.segments:
-            for seg in response.segments:
+            segs: list[dict] = list(response.segments) if response else []  # type: ignore[invalid-assignment,unresolved-attribute]
+
+            for seg in segs:
                 if isinstance(seg, dict):
                     segments.append(
                         {
@@ -112,12 +115,11 @@ def transcribe_chunk(
                 else:
                     segments.append(
                         {
-                            "start": seg.start,
-                            "end": seg.end,
-                            "text": seg.text,
+                            "start": seg.start,  # type: ignore[unresolved-attribute]  # type: ignore[unresolved-attribute]
+                            "end": seg.end,  # type: ignore[unresolved-attribute]  # type: ignore[unresolved-attribute]
+                            "text": seg.text,  # type: ignore[unresolved-attribute]  # type: ignore[unresolved-attribute]
                         }
                     )
-
         result_data = {
             "chunk": str(chunk_path),
             "start_time": 0.0,
@@ -294,20 +296,21 @@ def _transcribe_single_file(
         response = client.audio.transcriptions.create(
             file=(input_path.name, f.read()),
             model=model,
-            language=language,
+            **({"language": language} if language else {}),
             response_format="verbose_json",
             timestamp_granularities=["segment"],
         )
 
     segments = []
     if hasattr(response, "segments") and response.segments:
+        import typing as _typing
         segments = [
             {
-                "start": seg.start,
-                "end": seg.end,
-                "text": seg.text,
+                "start": _typing.cast(dict, seg).get("start", 0.0) if isinstance(seg, dict) else seg.start,  # noqa: F821
+                "end": _typing.cast(dict, seg).get("end", 0.0) if isinstance(seg, dict) else seg.end,  # noqa: F821
+                "text": _typing.cast(dict, seg).get("text", "") if isinstance(seg, dict) else seg.text,  # noqa: F821
             }
-            for seg in response.segments
+            for seg in response.segments  # type: ignore[not-iterable]
         ]
 
     srt_content = segments_to_srt(segments)

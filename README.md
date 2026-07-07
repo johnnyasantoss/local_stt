@@ -39,7 +39,7 @@ python scripts/audio-process -i meeting.m4a -o output/ --engine local -c -vvv
 
 # With speaker diarization (interactive, requires terminal)
 # Preferred: use audio-process with --diarize
-python scripts/audio-process -i meeting.m4a -o output/ --engine local --diarize --speakers 4 -vvv
+python scripts/audio-process -i meeting.m4a -o output/ --engine local --diarize --num-speakers 4 -vvv
 
 # Or standalone: audio-transcribe-local with --diarize
 python scripts/audio-transcribe-local -i output/chunks -o output/transcription.srt \
@@ -85,7 +85,7 @@ python scripts/audio-transcribe -i chunks/ -o output.srt -vvv  # Groq
 | `--language` | ISO 639-1 language code hint (e.g. `en`, `es`). Auto-detects if omitted. |
 | `-j, --threads` | Parallel worker threads. 0 = all cores (default: 0). |
 | `--overlap` | Chunk overlap in seconds (default: 5). |
-| `--size-mb` | Max chunk size in MiB (default: 10). |
+| `--list-models` | List available GGUF models and exit |
 
 ## Environment Variables
 

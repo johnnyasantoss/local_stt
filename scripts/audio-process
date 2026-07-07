@@ -62,16 +62,15 @@ def validate_args(args, logger) -> bool:
     if args.engine == "groq":
         load_env()
         import os
+
         if not os.getenv("GROQ_API_KEY"):
-            logger.error(
-                "--engine groq requires GROQ_API_KEY. "
-                "Set it in .env or export it."
-            )
+            logger.error("--engine groq requires GROQ_API_KEY. Set it in .env or export it.")
             valid = False
 
     if args.engine == "local":
         # Validate transcribe-cli binary + GGUF model early (fail fast).
         from src.local_transcribe import resolve_cli, resolve_model
+
         try:
             resolve_cli()
             resolve_model(args.model)
@@ -83,6 +82,7 @@ def validate_args(args, logger) -> bool:
         if args.diarize:
             load_env()
             import os
+
             if not os.getenv("HF_TOKEN"):
                 logger.error(
                     "--diarize requires HF_TOKEN. "
@@ -127,7 +127,9 @@ pipeline stages:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "-v", "-vv", "-vvv",
+        "-v",
+        "-vv",
+        "-vvv",
         action="count",
         default=0,
         help=(
@@ -138,7 +140,8 @@ pipeline stages:
         ),
     )
     parser.add_argument(
-        "-i", "--input",
+        "-i",
+        "--input",
         type=Path,
         required=True,
         help=(
@@ -148,7 +151,8 @@ pipeline stages:
         ),
     )
     parser.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         type=Path,
         required=True,
         help=(
@@ -192,7 +196,8 @@ pipeline stages:
         ),
     )
     parser.add_argument(
-        "-j", "--threads",
+        "-j",
+        "--threads",
         type=int,
         default=0,
         help=(
@@ -272,7 +277,8 @@ pipeline stages:
         ),
     )
     parser.add_argument(
-        "-c", "--continue",
+        "-c",
+        "--continue",
         action="store_true",
         dest="continue_run",
         help=(
@@ -371,8 +377,17 @@ pipeline stages:
             logger.info("[4/5] Splitting by size...")
             result = run_script(
                 "audio-split",
-                ["-i", str(conv_out), "-o", str(split_dir), "--size-mb", str(args.size_mb),
-                 "--overlap", str(args.overlap), "-v" * args.v],
+                [
+                    "-i",
+                    str(conv_out),
+                    "-o",
+                    str(split_dir),
+                    "--size-mb",
+                    str(args.size_mb),
+                    "--overlap",
+                    str(args.overlap),
+                    "-v" * args.v,
+                ],
                 logger,
                 args.threads,
             )
@@ -399,8 +414,10 @@ pipeline stages:
 
             if args.engine == "local":
                 local_args = [
-                    "-i", str(split_dir),
-                    "-o", str(transcription_path),
+                    "-i",
+                    str(split_dir),
+                    "-o",
+                    str(transcription_path),
                     "-v" * args.v,
                 ]
                 if args.model:
@@ -414,8 +431,10 @@ pipeline stages:
                 result = run_script("audio-transcribe-local", local_args, logger)
             else:
                 trans_args = [
-                    "-i", str(split_dir),
-                    "-o", str(transcription_path),
+                    "-i",
+                    str(split_dir),
+                    "-o",
+                    str(transcription_path),
                     "-v" * args.v,
                 ]
                 if args.model:
@@ -445,6 +464,7 @@ pipeline stages:
         # Clean intermediates only if --clean-temp, even on error/kill
         if args.clean_temp:
             import shutil
+
             shutil.rmtree(inter_dir, ignore_errors=True)
             logger.info("  Cleaned intermediates")
 

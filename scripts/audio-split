@@ -11,8 +11,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pydub import AudioSegment
 
-from src.audio import load_audio, get_audio_info
-from src.logging import setup_logging, add_verbose_arg
+from src.audio import get_audio_info, load_audio
+from src.logging import add_verbose_arg, setup_logging
 
 
 def calculate_chunk_duration(
@@ -30,14 +30,15 @@ def main() -> int:
     add_verbose_arg(parser)
     parser.add_argument("-i", "--input", type=Path, required=True, help="Input audio file")
     parser.add_argument("-o", "--output", type=Path, required=True, help="Output directory")
-    parser.add_argument("--size-mb", type=float, default=10, help="Max size per chunk in MiB (default: 10)")
+    parser.add_argument(
+        "--size-mb", type=float, default=10, help="Max size per chunk in MiB (default: 10)"
+    )
     parser.add_argument("--overlap", type=int, default=5, help="Overlap in seconds (default: 5)")
     parser.add_argument("--format", default="ogg", help="Output format (default: ogg)")
     parser.add_argument("--codec", default="libopus", help="Audio codec (default: libopus)")
     parser.add_argument("--bitrate", default="128000", help="Bitrate (default: 128000)")
     parser.add_argument(
-        "-j", "--threads", type=int, default=0,
-        help="Number of threads (0 = all cores, default: 0)"
+        "-j", "--threads", type=int, default=0, help="Number of threads (0 = all cores, default: 0)"
     )
 
     args = parser.parse_args()
@@ -62,12 +63,18 @@ def main() -> int:
         step_ms = chunk_duration_ms - overlap_ms
 
         if step_ms <= 0:
-            logger.warning(f"Overlap ({args.overlap}s) >= chunk duration ({chunk_duration_s}s), using 0 overlap")
+            logger.warning(
+                f"Overlap ({args.overlap}s) >= chunk duration ({chunk_duration_s}s), using 0 overlap"
+            )
             step_ms = chunk_duration_ms
             overlap_ms = 0
 
-        num_chunks = max(1, (total_ms - overlap_ms) // step_ms + (1 if total_ms % step_ms > overlap_ms else 0))
-        logger.info(f"Splitting into ~{num_chunks} chunks ({args.size_mb}MiB each, {args.overlap}s overlap, threads: {args.threads or 'all'})")
+        num_chunks = max(
+            1, (total_ms - overlap_ms) // step_ms + (1 if total_ms % step_ms > overlap_ms else 0)
+        )
+        logger.info(
+            f"Splitting into ~{num_chunks} chunks ({args.size_mb}MiB each, {args.overlap}s overlap, threads: {args.threads or 'all'})"
+        )
 
         base_name = input_path.stem
         chunks = []
@@ -91,7 +98,9 @@ def main() -> int:
             )
 
             size_mb = output_path.stat().st_size / (1024 * 1024)
-            logger.info(f"  Created: {output_path.name} ({len(chunk)/1000:.1f}s, {size_mb:.2f}MB)")
+            logger.info(
+                f"  Created: {output_path.name} ({len(chunk) / 1000:.1f}s, {size_mb:.2f}MB)"
+            )
 
             chunks.append(output_path)
             chunk_num += 1
