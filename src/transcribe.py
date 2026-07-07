@@ -3,14 +3,13 @@
 import json
 import logging
 import os
-import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
 from groq import Groq
 
-from src.srt import deduplicate_segments, segments_to_srt
+from src.srt import segments_to_srt
 
 MAX_FILE_SIZE_MB = 25
 DEFAULT_MODEL = "whisper-large-v3-turbo"
@@ -84,7 +83,7 @@ def transcribe_chunk(
                 segments=data.get("segments", []),
                 success=True,
             )
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
 
     validate_file_size(chunk_path)
