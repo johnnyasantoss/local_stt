@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import typing as _typing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,10 +99,9 @@ def transcribe_chunk(
                 timestamp_granularities=["segment"],
             )
 
-        segments = []
-        segments = []
+        segments: list[dict] = []
         if hasattr(response, "segments") and response.segments:
-            segs: list[dict] = list(response.segments) if response else []  # type: ignore[invalid-assignment,unresolved-attribute]
+            segs: list[dict] = list(_typing.cast(_typing.Iterable, response.segments))
 
             for seg in segs:
                 if isinstance(seg, dict):
@@ -301,16 +301,21 @@ def _transcribe_single_file(
             timestamp_granularities=["segment"],
         )
 
-    segments = []
+    segments: list[dict] = []
     if hasattr(response, "segments") and response.segments:
-        import typing as _typing
         segments = [
             {
-                "start": _typing.cast(dict, seg).get("start", 0.0) if isinstance(seg, dict) else seg.start,  # noqa: F821
-                "end": _typing.cast(dict, seg).get("end", 0.0) if isinstance(seg, dict) else seg.end,  # noqa: F821
-                "text": _typing.cast(dict, seg).get("text", "") if isinstance(seg, dict) else seg.text,  # noqa: F821
+                "start": _typing.cast(dict, seg).get("start", 0.0)
+                if isinstance(seg, dict)
+                else seg.start,  # noqa: F821
+                "end": _typing.cast(dict, seg).get("end", 0.0)
+                if isinstance(seg, dict)
+                else seg.end,  # noqa: F821
+                "text": _typing.cast(dict, seg).get("text", "")
+                if isinstance(seg, dict)
+                else seg.text,  # noqa: F821
             }
-            for seg in response.segments  # type: ignore[not-iterable]
+            for seg in _typing.cast(_typing.Iterable, response.segments)
         ]
 
     srt_content = segments_to_srt(segments)

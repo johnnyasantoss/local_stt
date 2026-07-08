@@ -37,6 +37,12 @@ ruff check --fix .
 just lint
 ```
 
+**Note:** `just lint` includes `uv check --preview-features check-command` which is stricter than pyright alone — always verify with the full command.
+
+### Type Diagnostics
+- Do not rely on `# type: ignore` for pyright errors — `uv check` (ty) ignores them; use `typing.cast` for type narrowing instead.
+
+
 ---
 
 ## File Structure

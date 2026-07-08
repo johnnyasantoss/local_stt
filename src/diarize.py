@@ -5,9 +5,16 @@ import os
 import shutil
 import subprocess
 import tempfile
+import typing as _typing
 from pathlib import Path
 
 import torch
+
+
+class _HasItertracks(_typing.Protocol):
+    """Protocol for pyannote Annotation types with itertracks method."""
+
+    def itertracks(self, yield_label: bool) -> _typing.Iterator[tuple]: ...
 
 
 def _ensure_wav(
@@ -144,7 +151,9 @@ def diarize_audio(
     segments = []
     # Guard against pyannote versions that do not expose itertracks (e.g. DiarizationOutput).
     if hasattr(annotation, "itertracks"):
-        it = annotation.itertracks(yield_label=True)  # type: ignore[call-non-callable]
+        # Use cast to avoid pyright/ty errors from hasattr narrowing.
+        _annotation = _typing.cast(_HasItertracks, annotation)
+        it = _annotation.itertracks(yield_label=True)
     else:
         it = []
 
