@@ -74,7 +74,7 @@ def validate_args(args, logger) -> bool:
         try:
             resolve_cli()
             resolve_model(args.model)
-        except FileNotFoundError as e:
+        except (FileNotFoundError, ValueError) as e:
             logger.error(str(e))
             valid = False
 
@@ -225,10 +225,10 @@ pipeline stages:
             "Model name for the chosen engine. For --engine groq: any "
             "Groq-supported model (e.g. distil-whisper-large-v3-en, "
             "whisper-large-v3). For --engine local: a GGUF path or HF cache short "
-            "name (defaults to whisper-large-v3-turbo Q8_0); use "
+            "name; use "
             "`scripts/audio-transcribe-local --list-models` to list cached handy-computer "
-            "GGUFs. If omitted, the "
-            "engine's default model is used. (default: engine default model)"
+            "GGUFs. Required for --engine local (no default model). For groq it "
+            "defaults to the API's default if omitted. "
         ),
     )
     parser.add_argument(

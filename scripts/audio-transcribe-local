@@ -71,8 +71,7 @@ def main() -> int:
     parser.add_argument(
         "-m",
         "--model",
-        default=None,
-        help="GGUF model path or HF cache short name. Default: whisper-large-v3-turbo Q8_0.",
+        help="GGUF model path or HF cache short name. Required (no default model).",
     )
     parser.add_argument(
         "-l",

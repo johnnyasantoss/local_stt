@@ -46,23 +46,36 @@ def resolve_cli() -> Path:
 def resolve_model(query: str | None = None) -> Path:
     """Resolve the GGUF model path. Fail fast if missing.
 
-    Precedence: explicit query (path or short name) > TCPP_MODEL env > default
-    whisper-large-v3-turbo Q8_0 in the HF cache.
+    Precedence: explicit query (path or short name) > TCPP_MODEL env.
+    No model defaults to whisper; the caller must supply a model name or set
+    TCPP_MODEL.
     """
     if query:
         cand = Path(query).expanduser()
         if cand.is_file():
             return cand
-        # short name like "whisper-large-v3-turbo" -> resolve from HF cache
-        short = query.removesuffix(".gguf")
-        for hit in (
-            Path("~/.cache/huggingface/hub")
-            .expanduser()
-            .glob(f"models--handy-computer--{short}-gguf/snapshots/*/*.gguf")
-        ):
-            return hit
-        raise FileNotFoundError(f"Model '{query}' not found as a path or HF cache entry.")
-
+        # short name (e.g. "cohere") -> fuzzy search HF cache folders + gguf names
+        short = query.removesuffix(".gguf").lower()
+        hub = Path("~/.cache/huggingface/hub").expanduser()
+        matches = []
+        for gguf in sorted(hub.glob("models--handy-computer--*-gguf/snapshots/*/*.gguf")):
+            folder_short = gguf.parent.parent.parent.name
+            folder_short = folder_short.removeprefix("models--handy-computer--").removesuffix(
+                "-gguf"
+            )
+            if short in folder_short.lower() or short in gguf.stem.lower():
+                matches.append(gguf)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            listing = "\n  ".join(str(m) for m in matches)
+            raise ValueError(
+                f"Model query '{query}' is ambiguous; multiple matches found:\n  {listing}\n"
+                "Pass a more specific query or the full path to the .gguf file."
+            )
+        raise FileNotFoundError(
+            f"Model '{query}' not found in HF cache (no folder/gguf name match)."
+        )
     env_model = os.environ.get("TCPP_MODEL")
     if env_model:
         cand = Path(env_model).expanduser()
@@ -70,21 +83,9 @@ def resolve_model(query: str | None = None) -> Path:
             raise FileNotFoundError(f"TCPP_MODEL={env_model} does not exist.")
         return cand
 
-    hits = list(
-        Path("~/.cache/huggingface/hub")
-        .expanduser()
-        .glob(
-            "models--handy-computer--whisper-large-v3-turbo-gguf/snapshots/*/"
-            "whisper-large-v3-turbo-Q8_0.gguf"
-        )
-    )
-    if hits:
-        return hits[-1]
-
-    raise FileNotFoundError(
-        "No GGUF model found. Download whisper-large-v3-turbo-Q8_0.gguf from "
-        "https://huggingface.co/handy-computer/whisper-large-v3-turbo-gguf or set "
-        "TCPP_MODEL to the path."
+    raise ValueError(
+        "No model specified. Pass a model name (e.g. 'cohere-transcribe-03-2026') "
+        "or set TCPP_MODEL to the .gguf path."
     )
 
 
@@ -237,7 +238,7 @@ def transcribe_local(
 
     Args:
         input_path: Single audio file or directory of chunks.
-        model_query: GGUF path or short model name. None = default turbo Q8_0.
+        model_query: GGUF path or short model name. Required: no default model.
         language: ISO 639-1 hint. None = auto-detect.
         vad_threshold: ignored (Whisper internal VAD). Kept for call-site compat.
         overlap_secs: overlap between chunks for offset math (chunk-dir mode).
@@ -249,7 +250,6 @@ def transcribe_local(
     """
     if logger is None:
         logger = logging.getLogger(__name__)
-
     cli = resolve_cli()
     model = resolve_model(model_query)
     logger.info(f"Using transcribe.cpp: {cli.name}  model={model.parent.name}/{model.name}")
