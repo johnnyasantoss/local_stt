@@ -338,11 +338,19 @@ def _transcribe_directory(
 
     # Map results back to chunks by file name. The CLI preserves batch order.
     all_segments = []
+    all_synthetic = True
     for i, (obj, offset_s) in enumerate(zip(results, offsets, strict=True)):
         if "error" in obj:
             logger.error(f"  [{i + 1}/{len(audio_files)}] {audio_files[i].name}: {obj['error']}")
             continue
         segs = _segs_from_jsonl(obj, offset_s)
+        # Models like cohere/granite may return text but no per-word segments.
+        # Create a single synthetic segment spanning the full chunk duration.
+        if not segs and obj.get("text", "").strip():
+            chunk_dur = get_audio_duration(audio_files[i])
+            segs = [{"start": offset_s, "end": offset_s + chunk_dur, "text": obj["text"].strip()}]
+        else:
+            all_synthetic = False
         all_segments.extend(segs)
         logger.info(f"  [{i + 1}/{len(audio_files)}] {audio_files[i].name}: {len(segs)} segments")
 
@@ -350,6 +358,10 @@ def _transcribe_directory(
         return []
 
     all_segments.sort(key=lambda x: x["start"])
+    # Synthetic segments (text-only models) represent full chunks — they must not
+    # be merged across overlapping chunk boundaries.
+    if all_synthetic:
+        return all_segments
     return deduplicate_segments(all_segments, overlap_threshold=0.3)
 
 
