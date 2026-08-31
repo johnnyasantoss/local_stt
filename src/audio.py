@@ -19,7 +19,34 @@ SUPPORTED_EXTENSIONS: set[str] = {
     "webm",
 }
 
+
 SAMPLE_RATE = 16000
+
+
+def numeric_sort_key(path: Path) -> list[tuple[str | int]]:
+    """Sort key that orders filenames with embedded numbers numerically.
+
+    Plain lexicographic sorting mis-orders chunk files once indices exceed the
+    zero-padding width (e.g. processed_1000.ogg sorts before processed_999.ogg
+    because "1" < "9"). That scrambles chunk order and, since offsets are
+    computed as index*step, assigns every later chunk the wrong timestamp.
+    This key splits the name into text/digit runs so 1000 > 999.
+    """
+    import re
+
+    return [
+        (int(tok) if tok.isdigit() else tok.lower(),)
+        for tok in re.split(r"(\d+)", path.name)
+        if tok != ""
+    ]
+
+
+def sorted_audio_chunks(directory: Path, pattern: str = "*.ogg") -> list[Path]:
+    """Return audio chunk files in numeric order (see numeric_sort_key)."""
+    return sorted(
+        (p for p in directory.glob(pattern) if p.is_file()),
+        key=numeric_sort_key,
+    )
 
 
 def chunk_step_seconds(chunk_duration_s: float, overlap_s: float) -> float:

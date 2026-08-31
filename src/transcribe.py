@@ -50,10 +50,10 @@ def validate_file_size(path: Path, max_mb: float = MAX_FILE_SIZE_MB) -> None:
 
 
 def get_audio_files_from_dir(directory: Path) -> list[Path]:
-    """Get all audio files from directory, sorted by name."""
+    """Get all audio files from directory, in numeric filename order."""
     audio_extensions = {".ogg", ".wav", ".mp3", ".m4a", ".flac", ".webm"}
     files = [f for f in directory.iterdir() if f.is_file() and f.suffix.lower() in audio_extensions]
-    return sorted(files, key=lambda x: x.name)
+    return sorted(files, key=audio.numeric_sort_key)
 
 
 def find_existing_transcripts(directory: Path, prefix: str) -> set[Path]:

@@ -13,10 +13,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.audio import numeric_sort_key
 from src.config import load_env
 from src.diarize import load_speaker_mapping
-from src.logging import setup_logging
 from src.local_transcribe import model_audio_window_seconds, resolve_model
+from src.logging import setup_logging
 
 
 def _effective_max_seconds(args) -> float | None:
@@ -91,7 +92,7 @@ def validate_args(args, logger) -> bool:
 
     if args.engine == "local":
         # Validate transcribe-cli binary + GGUF model early (fail fast).
-        from src.local_transcribe import resolve_cli, resolve_model, model_audio_window_seconds
+        from src.local_transcribe import resolve_cli, resolve_model
 
         try:
             resolve_cli()
@@ -405,7 +406,7 @@ pipeline stages:
             )
         )
         if split_cached:
-            chunk_files = sorted(split_dir.glob("*.ogg"))
+            chunk_files = sorted(split_dir.glob("*.ogg"), key=numeric_sort_key)
             logger.info(f"[4/5] Split: cached ({len(chunk_files)} chunks)")
         else:
             if split_dir.exists() and any(split_dir.glob("*.ogg")):

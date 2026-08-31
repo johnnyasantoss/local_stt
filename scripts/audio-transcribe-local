@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
 
+from src.audio import numeric_sort_key
 from src.local_transcribe import discover_models, transcribe_local
 from src.logging import add_verbose_arg, setup_logging
 from src.srt import parse_srt, segments_to_srt
@@ -61,12 +62,15 @@ def _correct_srt_offsets_for_opus_preskip(segments: list[dict], sidecar: Path) -
     # Measure the real per-chunk pre-skip from one chunk if available.
     preskip_s = 0.0
     chunk_dir = sidecar.parent
-    chunks = [p for p in chunk_dir.glob("*.ogg") if p.is_file()]
+    chunks = sorted(
+        (p for p in chunk_dir.glob("*.ogg") if p.is_file()),
+        key=numeric_sort_key,
+    )
     if chunks:
         from src.audio import get_audio_duration
 
         try:
-            real_dur = get_audio_duration(sorted(chunks)[0])
+            real_dur = get_audio_duration(chunks[0])
             preskip_s = max(0.0, real_dur - chunk_s)
         except Exception:
             preskip_s = 0.0

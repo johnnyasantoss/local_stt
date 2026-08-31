@@ -445,7 +445,8 @@ def _transcribe_directory(
     good chunk instead of losing the entire run to one bad chunk.
     """
     audio_files = sorted(
-        f for f in input_dir.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
+        (f for f in input_dir.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS),
+        key=audio.numeric_sort_key,
     )
     if not audio_files:
         raise FileNotFoundError(f"No audio files found in: {input_dir}")
