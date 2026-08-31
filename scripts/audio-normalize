@@ -38,6 +38,8 @@ def normalize_loudness(
         str(input_path),
         "-af",
         f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11",
+        "-rf64",
+        "auto",
         "-y",
         str(output_path),
     ]

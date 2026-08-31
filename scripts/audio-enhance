@@ -32,7 +32,9 @@ def enhance_audio(
         "-i",
         str(input_path),
         "-af",
-        f"highpass=f={high_pass},lowpass=f={low_pass}",
+        f"highpass=f={high_pass},lowpass=f={low_pass},alimiter=level=disabled:limit=0.9",
+        "-rf64",
+        "auto",
         "-y",
         str(output_path),
     ]
