@@ -23,15 +23,20 @@ AUDIO_EXTENSIONS = [".ogg", ".opus", ".wav", ".m4a", ".mp3", ".flac", ".webm"]
 
 
 def _correct_srt_offsets_for_opus_preskip(segments: list[dict], sidecar: Path) -> list[dict]:
-    """Shift cached-SRT segment times back onto the continuous-WAV timeline.
+    """Re-map cached-SRT segment times onto the correct chunk grid.
 
-    Older/cached SRTs were written with chunk offsets summed from each Opus
-    chunk's ffprobe duration, which includes the per-chunk 312-sample pre-skip.
-    The continuous diarize WAV decodes the single source stream once, so it
-    steps by the true source length and every chunk k is offset forward by
-    k * pre_skip. Re-derive that drift from the split sidecar and subtract it
-    so the displayed and played timestamp matches the WAV position. Returns the
-    segments unchanged if the sidecar is missing or the params can't be read.
+    Two generations of SRT exist: ones written by the buggy offset math
+    (which summed each Opus chunk's ffprobe duration, including the per-chunk
+    312-sample / 6.5ms pre-skip, drifting the timeline forward by ~k*pre_skip
+    over a long file) and ones written after the fix (already on the nominal
+    chunk grid). We decide which from the SRT's overall span rather than
+    per-segment, because a drifted segment near a chunk start can otherwise
+    masquerade as already-correct: the implied per-chunk step
+    (last_start / (num_chunks-1)) matches either the correct grid (step) or
+    the drifted grid (step+pre_skip). If it matches the correct grid the SRT
+    is left untouched (re-running on an already-fixed SRT is a no-op); if it
+    matches the drifted grid the pre-skip drift is subtracted from every
+    segment. Returns segments unchanged if the sidecar/chunks are missing.
     """
     if not sidecar.is_file():
         return segments
@@ -49,34 +54,51 @@ def _correct_srt_offsets_for_opus_preskip(segments: list[dict], sidecar: Path) -
     chunk_s = int(size_mb * 1024 * 1024 * 8 / bitrate)
     if max_seconds is not None:
         chunk_s = int(min(chunk_s, float(max_seconds)))
-    nominal_step = max(0.0, chunk_s - overlap)
-    if nominal_step <= 0:
+    step = max(0.0, chunk_s - overlap)
+    if step <= 0:
         return segments
 
     # Measure the real per-chunk pre-skip from one chunk if available.
     preskip_s = 0.0
     chunk_dir = sidecar.parent
-    first_chunk = next(
-        (p for p in sorted(chunk_dir.glob("*.ogg")) if p.is_file()), None
-    )
-    if first_chunk is not None:
+    chunks = [p for p in chunk_dir.glob("*.ogg") if p.is_file()]
+    if chunks:
         from src.audio import get_audio_duration
 
         try:
-            real_dur = get_audio_duration(first_chunk)
+            real_dur = get_audio_duration(sorted(chunks)[0])
             preskip_s = max(0.0, real_dur - chunk_s)
         except Exception:
             preskip_s = 0.0
     if preskip_s <= 0:
         return segments
 
-    # Inflated step = nominal step + the per-chunk pre-skip the old math summed.
-    step_inflated = nominal_step + preskip_s
+    if len(chunks) < 2 or not segments:
+        return segments
+    last_start = max(seg.get("start", 0.0) for seg in segments)
+    if last_start <= 0:
+        return segments
+    # Discriminate the two grids using a mid-file reference segment, where the
+    # cumulative drift (k*pre_skip) is large and unambiguous. A partial final
+    # chunk would otherwise blur the global span between the 13.0 (correct) and
+    # 13.0065 (drifted) steps.
+    ref = min(segments, key=lambda s: abs(s.get("start", 0.0) - 0.5 * last_start))
+    ref_start = ref.get("start", 0.0)
+    k_ref = int(ref_start / step + 0.5)
+    drift = ref_start - k_ref * step
+    tol = preskip_s * 3.0
+    if abs(drift) <= tol:
+        return segments  # already on the correct grid; no-op
+    if abs(drift - k_ref * preskip_s) > tol:
+        return segments  # neither grid matches; leave untouched
+
+    # Drifted grid: subtract k*pre_skip from each segment (k = its chunk index).
     for seg in segments:
-        k = int(seg.get("start", 0.0) / step_inflated)
-        corr = k * preskip_s
-        seg["start"] = max(0.0, seg["start"] - corr)
-        seg["end"] = max(seg["start"], seg["end"] - corr)
+        start = seg.get("start", 0.0)
+        k = int(start / (step + preskip_s) + 0.5)
+        shift = k * preskip_s
+        seg["start"] = max(0.0, start - shift)
+        seg["end"] = max(seg["start"], seg["end"] - shift)
     return segments
 
 
