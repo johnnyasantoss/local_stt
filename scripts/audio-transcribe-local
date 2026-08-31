@@ -22,6 +22,64 @@ load_dotenv()
 AUDIO_EXTENSIONS = [".ogg", ".opus", ".wav", ".m4a", ".mp3", ".flac", ".webm"]
 
 
+def _correct_srt_offsets_for_opus_preskip(segments: list[dict], sidecar: Path) -> list[dict]:
+    """Shift cached-SRT segment times back onto the continuous-WAV timeline.
+
+    Older/cached SRTs were written with chunk offsets summed from each Opus
+    chunk's ffprobe duration, which includes the per-chunk 312-sample pre-skip.
+    The continuous diarize WAV decodes the single source stream once, so it
+    steps by the true source length and every chunk k is offset forward by
+    k * pre_skip. Re-derive that drift from the split sidecar and subtract it
+    so the displayed and played timestamp matches the WAV position. Returns the
+    segments unchanged if the sidecar is missing or the params can't be read.
+    """
+    if not sidecar.is_file():
+        return segments
+    try:
+        import json
+
+        meta = json.loads(sidecar.read_text(encoding="utf-8"))
+        size_mb = float(meta["size_mb"])
+        bitrate = int(meta["bitrate"])
+        max_seconds = meta.get("max_seconds")
+        overlap = float(meta.get("overlap", 0))
+    except (KeyError, ValueError, json.JSONDecodeError):
+        return segments
+
+    chunk_s = int(size_mb * 1024 * 1024 * 8 / bitrate)
+    if max_seconds is not None:
+        chunk_s = int(min(chunk_s, float(max_seconds)))
+    nominal_step = max(0.0, chunk_s - overlap)
+    if nominal_step <= 0:
+        return segments
+
+    # Measure the real per-chunk pre-skip from one chunk if available.
+    preskip_s = 0.0
+    chunk_dir = sidecar.parent
+    first_chunk = next(
+        (p for p in sorted(chunk_dir.glob("*.ogg")) if p.is_file()), None
+    )
+    if first_chunk is not None:
+        from src.audio import get_audio_duration
+
+        try:
+            real_dur = get_audio_duration(first_chunk)
+            preskip_s = max(0.0, real_dur - chunk_s)
+        except Exception:
+            preskip_s = 0.0
+    if preskip_s <= 0:
+        return segments
+
+    # Inflated step = nominal step + the per-chunk pre-skip the old math summed.
+    step_inflated = nominal_step + preskip_s
+    for seg in segments:
+        k = int(seg.get("start", 0.0) / step_inflated)
+        corr = k * preskip_s
+        seg["start"] = max(0.0, seg["start"] - corr)
+        seg["end"] = max(seg["start"], seg["end"] - corr)
+    return segments
+
+
 def _find_full_audio(input_path: Path) -> Path:
     """Auto-detect the full continuous audio file for diarization.
 
@@ -81,8 +139,12 @@ def main() -> int:
     parser.add_argument(
         "--overlap-secs",
         type=float,
-        default=5.0,
-        help="Overlap seconds for chunk merging (default: 5)",
+        default=2.0,
+        help=(
+            "Overlap seconds used when splitting (default: 2). Lower overlap "
+            "duplicates less audio per boundary, reducing transcription cost; "
+            "2s preserves word boundaries for 15-65s model windows."
+        ),
     )
     parser.add_argument(
         "-j",
@@ -103,7 +165,6 @@ def main() -> int:
         default=None,
         help="Path to .speakers.json mapping (skip interactive prompt)",
     )
-
     args = parser.parse_args()
     logger = setup_logging(args.v)
 
@@ -124,6 +185,14 @@ def main() -> int:
         if args.output.exists() and args.output.stat().st_size > 0:
             logger.info(f"Loading existing transcription: {args.output}")
             segments = parse_srt(args.output.read_text(encoding="utf-8"))
+            # Re-align cached segment times to the continuous-WAV timeline if a
+            # split sidecar is present (corrects Opus pre-skip drift baked into
+            # SRTs written before the offset fix).
+            if args.input.is_dir():
+                sidecar = args.input / ".split-meta.json"
+            else:
+                sidecar = args.input.parent / "chunks" / ".split-meta.json"
+            segments = _correct_srt_offsets_for_opus_preskip(segments, sidecar)
             logger.info(f"Loaded {len(segments)} segments from SRT")
         else:
             segments = transcribe_local(

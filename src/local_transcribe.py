@@ -553,15 +553,54 @@ def _transcribe_directory(
     return deduplicate_segments(all_segments, overlap_threshold=0.3)
 
 
+def chunk_step_seconds(chunk_duration_s: float, overlap_s: float) -> float:
+    """Nominal source advance between consecutive chunk starts.
+
+    A splitter slices the source into ``chunk_duration_s`` windows that
+    overlap by ``overlap_s`` seconds, so each chunk (except the first) starts
+    ``chunk_duration_s - overlap_s`` later than the previous one. This is the
+    timeline step used to place a chunk's transcript segments in the continuous
+    source, and it must match exactly what audio-split used when slicing.
+    """
+    return max(0.0, float(chunk_duration_s) - float(overlap_s))
+
+
 def _calculate_chunk_offsets(
     audio_files: list[Path],
     overlap_secs: float,
     logger: logging.Logger,
 ) -> list[float]:
-    """Calculate cumulative time offsets for each chunk using ffprobe.
+    """Calculate cumulative time offsets for each chunk.
 
-    Chunk N starts at: sum(duration[0..N-1]) - N * overlap_secs
+    Each Opus chunk is encoded with a fixed pre-skip (312 samples @ 48kHz ~=
+    6.5ms), which ffprobe reports as part of the raw stream duration. Summing
+    those per-chunk decoded durations therefore over-counts every step and
+    drifts the transcript timeline forward of the continuous diarize WAV (which
+    decodes the single source stream once, so it carries only one pre-skip and
+    steps by the true source slice length). Over a 1400-chunk file this reaches
+    ~9s of desync between the displayed timestamp and the audio it seeks to.
+
+    Instead step by the NOMINAL source length the splitter used:
+            chunk_s = int(size_mb * 1024 * 1024 * 8 / bitrate)
+            if max_seconds is not None:
+                chunk_s = int(min(chunk_s, float(max_seconds)))
+            step = chunk_step_seconds(chunk_s, overlap_secs)
+            return [max(0.0, k * step) for k in range(len(audio_files))]
     """
+    sidecar = audio_files[0].parent / ".split-meta.json" if audio_files else None
+    if sidecar is not None and sidecar.is_file():
+        try:
+            meta = json.loads(sidecar.read_text(encoding="utf-8"))
+            size_mb = float(meta["size_mb"])
+            bitrate = int(meta["bitrate"])
+            max_seconds = meta.get("max_seconds")
+            chunk_s = int(size_mb * 1024 * 1024 * 8 / bitrate)
+            if max_seconds is not None:
+                chunk_s = int(min(chunk_s, float(max_seconds)))
+            step = max(0.0, chunk_s - float(overlap_secs))
+            return [max(0.0, k * step) for k in range(len(audio_files))]
+        except (KeyError, ValueError, json.JSONDecodeError) as e:
+            logger.warning(f"  split sidecar unreadable ({e}); summing chunk durations")
     offsets = []
     cumulative = 0.0
     for i, f in enumerate(audio_files):
