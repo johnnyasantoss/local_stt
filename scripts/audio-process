@@ -6,6 +6,7 @@ A stage is skipped if its output file already exists (use --force to re-run all)
 """
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -15,7 +16,28 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.config import load_env
 from src.diarize import load_speaker_mapping
 from src.logging import setup_logging
+from src.local_transcribe import model_audio_window_seconds, resolve_model
 
+
+def _effective_max_seconds(args) -> float | None:
+    """Resolve the per-model chunk cap that will be applied at split time."""
+    if args.engine != "local":
+        return None
+    try:
+        return model_audio_window_seconds(resolve_model(args.model))
+    except Exception:
+        return None
+
+
+def _split_meta_matches(meta_path: Path, size_mb: float, overlap: int, max_seconds: float | None) -> bool:
+    """True if the cached split parameters match the current request."""
+    try:
+        meta = json.loads(meta_path.read_text())
+    except Exception:
+        return False
+    if meta.get("size_mb") != size_mb or meta.get("overlap") != overlap:
+        return False
+    return meta.get("max_seconds") == max_seconds
 
 def run_script(script: str, args: list, logger, threads: int = 0) -> subprocess.CompletedProcess:
     """Run a script, streaming stdout/stderr to the pipeline log in real-time.
@@ -69,7 +91,7 @@ def validate_args(args, logger) -> bool:
 
     if args.engine == "local":
         # Validate transcribe-cli binary + GGUF model early (fail fast).
-        from src.local_transcribe import resolve_cli, resolve_model
+        from src.local_transcribe import resolve_cli, resolve_model, model_audio_window_seconds
 
         try:
             resolve_cli()
@@ -370,24 +392,50 @@ pipeline stages:
 
         # Stage 4: Split
         split_dir = output_dir / "chunks"
-        if split_dir.exists() and any(split_dir.iterdir()) and not args.force:
-            chunk_files = sorted(split_dir.glob("*"))
+        split_meta = split_dir / ".split-meta.json"
+        split_cached = (
+            split_dir.exists()
+            and any(split_dir.glob("*.ogg"))
+            and split_meta.is_file()
+            and _split_meta_matches(
+                split_meta,
+                size_mb=args.size_mb,
+                overlap=args.overlap,
+                max_seconds=_effective_max_seconds(args),
+            )
+        )
+        if split_cached:
+            chunk_files = sorted(split_dir.glob("*.ogg"))
             logger.info(f"[4/5] Split: cached ({len(chunk_files)} chunks)")
         else:
-            logger.info("[4/5] Splitting by size...")
+            if split_dir.exists() and any(split_dir.glob("*.ogg")):
+                logger.info("[4/5] Split: params changed, re-splitting...")
+                for stale in split_dir.glob("*.ogg"):
+                    stale.unlink()
+            else:
+                logger.info("[4/5] Splitting by size...")
+            split_args = [
+                "-i",
+                str(conv_out),
+                "-o",
+                str(split_dir),
+                "--size-mb",
+                str(args.size_mb),
+                "--overlap",
+                str(args.overlap),
+            ]
+            if args.engine == "local":
+                try:
+                    cap = model_audio_window_seconds(resolve_model(args.model))
+                except Exception as e:
+                    cap = None
+                    logger.debug(f"Could not determine model audio window: {e}")
+                if cap is not None:
+                    split_args += ["--max-seconds", str(cap)]
+            split_args += ["-v" * args.v]
             result = run_script(
                 "audio-split",
-                [
-                    "-i",
-                    str(conv_out),
-                    "-o",
-                    str(split_dir),
-                    "--size-mb",
-                    str(args.size_mb),
-                    "--overlap",
-                    str(args.overlap),
-                    "-v" * args.v,
-                ],
+                split_args,
                 logger,
                 args.threads,
             )

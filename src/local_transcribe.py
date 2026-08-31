@@ -12,6 +12,7 @@ audio internally).
 import json
 import logging
 import os
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -87,6 +88,134 @@ def resolve_model(query: str | None = None) -> Path:
         "No model specified. Pass a model name (e.g. 'cohere-transcribe-03-2026') "
         "or set TCPP_MODEL to the .gguf path."
     )
+
+
+class _GGUFReader:
+    """Sequential cursor over a binary GGUF stream (read-past, no buffering)."""
+
+    def __init__(self, f):
+        self.f = f
+
+    def _read(self, n: int) -> bytes:
+        data = self.f.read(n)
+        if len(data) < n:
+            raise EOFError("unexpected end of GGUF file")
+        return data
+
+    def u8(self) -> int:
+        return self._read(1)[0]
+
+    def u16(self) -> int:
+        return struct.unpack("<H", self._read(2))[0]
+
+    def u32(self) -> int:
+        return struct.unpack("<I", self._read(4))[0]
+
+    def u64(self) -> int:
+        return struct.unpack("<Q", self._read(8))[0]
+
+    def f32(self) -> float:
+        return struct.unpack("<f", self._read(4))[0]
+
+    def string(self) -> str:
+        n = self.u64()
+        return self._read(n).decode("utf-8", "replace")
+
+
+# GGUF metadata value type codes.
+_GGUF_U8 = 0
+_GGUF_I8 = 1
+_GGUF_U16 = 2
+_GGUF_I16 = 3
+_GGUF_U32 = 4
+_GGUF_I32 = 5
+_GGUF_F32 = 6
+_GGUF_BOOL = 7
+_GGUF_STRING = 8
+_GGUF_ARRAY = 9
+
+
+def _read_gguf_value(reader: _GGUFReader, value_type: int) -> object:
+    """Read one GGUF metadata value of the given type, advancing the cursor."""
+    if value_type == _GGUF_U8:
+        return reader.u8()
+    if value_type == _GGUF_I8:
+        return struct.unpack("<b", reader._read(1))[0]
+    if value_type == _GGUF_U16:
+        return reader.u16()
+    if value_type == _GGUF_I16:
+        return struct.unpack("<h", reader._read(2))[0]
+    if value_type == _GGUF_U32:
+        return reader.u32()
+    if value_type == _GGUF_I32:
+        return struct.unpack("<i", reader._read(4))[0]
+    if value_type == _GGUF_F32:
+        return reader.f32()
+    if value_type == _GGUF_BOOL:
+        return reader.u8() != 0
+    if value_type == _GGUF_STRING:
+        return reader.string()
+    if value_type == _GGUF_ARRAY:
+        sub_type = reader.u32()
+        count = reader.u64()
+        return [_read_gguf_value(reader, sub_type) for _ in range(count)]
+    raise ValueError(f"unknown GGUF value type {value_type}")
+
+
+def read_gguf_metadata(path: Path, wanted: set[str]) -> dict[str, object]:
+    """Read ONLY the requested GGUF metadata keys, discarding all others.
+
+    Reads past (but does not store) unwanted values, so large arrays such as
+    tokenizer.ggml.tokens are skipped without being materialized. Raises on a
+    malformed header or any parse error.
+    """
+    result: dict[str, object] = {}
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise ValueError(f"not a GGUF file: {path}")
+        reader = _GGUFReader(f)
+        version = reader.u32()
+        if version not in (2, 3):
+            raise ValueError(f"unsupported GGUF version {version}")
+        reader.u64()  # tensor_count
+        n_kv = reader.u64()
+        for _ in range(n_kv):
+            key = reader.string()
+            value_type = reader.u32()
+            if key in wanted and key not in result:
+                result[key] = _read_gguf_value(reader, value_type)
+            else:
+                # Read and discard unwanted values (large arrays are skipped here).
+                _read_gguf_value(reader, value_type)
+    return result
+
+
+# Maximum audio clip window (seconds) per GGUF architecture. None means no
+# per-file cap (the engine chunks long audio internally).
+#   cohere_asr: 30s is safely under its 50s positional limit
+#     (pos_emb_max_len 5000 * hop 160 / sample_rate 16000) and the model card's
+#     ~30-35s clip window.
+#   whisper: None (transcribe.cpp chunks 30s windows internally).
+GGUF_ARCH_MAX_AUDIO_SEC: dict[str, float | None] = {
+    "cohere_asr": 15.0,
+    "whisper": None,
+}
+
+
+def model_audio_window_seconds(path: Path) -> float | None:
+    """Return the per-file audio cap (seconds) for a GGUF model, else None.
+
+    Detects the architecture from GGUF metadata and maps it to the max clip
+    window. Never raises: any parse error yields None (no cap applied).
+    """
+    try:
+        meta = read_gguf_metadata(path, {"general.architecture"})
+        arch = meta.get("general.architecture")
+        if not isinstance(arch, str):
+            return None
+        return GGUF_ARCH_MAX_AUDIO_SEC.get(arch, None)
+    except Exception:
+        return None
 
 
 def discover_models() -> list[dict]:
