@@ -198,12 +198,12 @@ pipeline stages:
     parser.add_argument(
         "--overlap",
         type=int,
-        default=5,
+        default=2,
         help=(
-            "Overlap in seconds between consecutive audio chunks during the "
-            "split stage. Prevents words from being cut off at chunk boundaries. "
-            "Higher values give more context but increase total audio volume "
-            "(and API cost for Groq). (default: 5)"
+            "Seconds of overlap between consecutive chunks (default: 2). "
+            "Overlap duplicates audio the model re-transcribes; 2s is enough "
+            "for cohere/whisper 15-65s windows to not drop mid-boundary words "
+            "while cutting redundant transcription versus the old 5s default."
         ),
     )
     parser.add_argument(

@@ -34,7 +34,7 @@ def main() -> int:
     parser.add_argument(
         "--size-mb", type=float, default=10, help="Max size per chunk in MiB (default: 10)"
     )
-    parser.add_argument("--overlap", type=int, default=5, help="Overlap in seconds (default: 5)")
+    parser.add_argument("--overlap", type=int, default=2, help="Overlap in seconds (default: 2)")
     parser.add_argument("--format", default="ogg", help="Output format (default: ogg)")
     parser.add_argument("--codec", default="libopus", help="Audio codec (default: libopus)")
     parser.add_argument("--bitrate", default="128000", help="Bitrate (default: 128000)")
