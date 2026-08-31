@@ -205,9 +205,11 @@ def get_speaker_samples(
 ) -> tuple[dict[str, list[dict]], dict[str, int]]:
     """Group segments by speaker, return the best samples for labeling.
 
-    Prefers long, substantive segments (>=2s duration, >=10 chars text)
-    so the user can clearly hear and identify each speaker's voice.
-    Falls back to shorter segments if not enough long ones exist.
+    Prefers substantive, long-enough segments (>=2s duration, >=10 chars text)
+    so the user can clearly hear and identify each speaker's voice. Samples are
+    chosen from the EARLIEST part of the audio (smallest start time) first, so
+    the user labels speakers without seeking back through a long recording.
+    Falls back to later segments only if a speaker has no early substantive ones.
 
     Returns (samples_by_speaker, segment_counts).
     """
@@ -229,19 +231,19 @@ def get_speaker_samples(
 
     picked: dict[str, list[dict]] = {}
     for speaker, segs in all_segs.items():
-        # Prefer long segments with substantive text
+        # Prefer substantive, long-enough segments, then take the earliest ones
+        # so labeling stays near the start of a long recording.
         substantive = [
             s for s in segs if (s["end"] - s["start"]) >= 2.0 and len(s["text"].strip()) >= 10
         ]
-        # Sort by duration descending — longest segments are clearest for ID
-        substantive.sort(key=lambda s: s["end"] - s["start"], reverse=True)
+        substantive.sort(key=lambda s: s["start"])
 
         if len(substantive) >= max_samples:
             picked[speaker] = substantive[:max_samples]
         else:
-            # Use all substantive, fill remaining with shorter ones
+            # Use all substantive, then fill remaining with the earliest shorter ones.
             remaining = [s for s in segs if s not in substantive]
-            remaining.sort(key=lambda s: s["end"] - s["start"], reverse=True)
+            remaining.sort(key=lambda s: s["start"])
             picked[speaker] = (substantive + remaining)[:max_samples]
 
     return picked, dict(counts)
@@ -358,7 +360,10 @@ def prompt_speaker_labels(
             default = prev.get(speaker_id, "")
             count = sum(1 for s in diarization_segments if s["speaker"] == speaker_id)
             print(f"  {speaker_id} ({count} diarization segments)")
-            # Show transcription samples when available (with text preview).
+            last_played: float | None = None
+            # Show transcription samples (text preview + matching audio snippet).
+            # Playback uses the SAME segment start that is displayed, so the
+            # audio the user hears lines up with the text on screen.
             trans_segs: list[dict] = samples_by_transcription.get(speaker_id, [])
             if trans_segs:
                 for seg in trans_segs[:3]:
@@ -366,21 +371,27 @@ def prompt_speaker_labels(
                     text = re.sub(r"^\[.+?\]:\s*", "", seg.get("text", ""))
                     preview = (text or "<silence>")[:80] + ("..." if len(text) > 80 else "")
                     print(f'    [{ts}] "{preview}"')
-
-            # Show diarization audio snippets for speakers without transcription overlap.
-            if not trans_segs:
+                    dur = max(2.0, min(seg["end"] - seg["start"], 5.0))
+                    if wav_path is not None and wav_path.is_file():
+                        try:
+                            _play_audio_snippet(wav_path, seg["start"], dur)
+                            last_played = seg["start"]
+                        except (OSError, subprocess.SubprocessError):
+                            pass
+            else:
+                # No transcription overlap: play diarization segments instead.
                 dsegs = _speaker_diarization_segments(speaker_id, diarization_segments)
                 for seg in dsegs[:3]:
+                    ts = _format_timestamp(seg["start"])
                     dur = max(2.0, min(seg["end"] - seg["start"], 5.0))
                     print(f"    [{ts}] (~{dur:.1f}s) — press h+Enter to hear")
                     if wav_path is not None and wav_path.is_file():
                         try:
                             _play_audio_snippet(wav_path, seg["start"], dur)
+                            last_played = seg["start"]
                         except (OSError, subprocess.SubprocessError):
                             pass
-
             prompt = f"  Enter name for {speaker_id} [{default or 'Speaker'}]: "
-            last_played: float | None = None
             while True:
                 try:
                     reply = input(prompt).strip()

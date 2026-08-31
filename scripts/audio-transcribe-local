@@ -141,13 +141,6 @@ def main() -> int:
             import json
             import sys as _sys
 
-            if not _sys.stdin.isatty():
-                logger.error(
-                    "Diarization requires an interactive terminal for speaker labeling. "
-                    "Run directly in your terminal (not piped or backgrounded)."
-                )
-                return 1
-
             from src.diarize import (
                 _ensure_wav,
                 apply_speaker_labels,
@@ -198,7 +191,7 @@ def main() -> int:
 
             if speaker_finalized:
                 logger.info("Using finalized speaker labels (skipping prompt)")
-            else:
+            elif _sys.stdin.isatty():
                 # Prompt for speaker labels (shows saved labels as defaults)
                 samples, _ = get_speaker_samples(segments)
                 # Locate the cached diarize WAV for audio playback (or skip if unavailable).
@@ -207,13 +200,19 @@ def main() -> int:
                 speaker_labels, speaker_finalized = prompt_speaker_labels(
                     samples, diarization_segments, wav_path=wav_path, existing_labels=speaker_labels
                 )
+            else:
+                logger.warning(
+                    "Not a TTY; skipping interactive speaker labeling. "
+                    "Segments keep default SPEAKER_N labels (re-run in a terminal to name them)."
+                )
 
             sp_path = args.output.with_suffix(".speakers.json")
-            save_speaker_mapping(speaker_labels, sp_path, finalized=speaker_finalized)
+            save_speaker_mapping(speaker_labels or {}, sp_path, finalized=speaker_finalized)
             logger.info(f"Saved speaker mapping to {sp_path}")
 
-            segments = apply_speaker_labels(segments, speaker_labels)
+            segments = apply_speaker_labels(segments, speaker_labels or {})
             include_speakers = True
+            srt_content = segments_to_srt(segments, include_speakers=include_speakers)
 
         srt_content = segments_to_srt(segments, include_speakers=include_speakers)
 
