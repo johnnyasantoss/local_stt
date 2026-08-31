@@ -265,7 +265,7 @@ def _run_cli(
     batch_file: Path,
     language: str | None,
     logger: logging.Logger,
-) -> list[dict]:
+) -> tuple[list[dict], str | None]:
     """Run transcribe-cli in batch-jsonl mode and return parsed per-file results.
 
     Returns a list of dicts: {"file": str, "segments": [...], "text": str, "error": str?}.
@@ -293,9 +293,7 @@ def _run_cli(
         encoding="utf-8",
         errors="replace",
     )
-
     results = []
-    assert proc.stdout is not None, "Popen stdout must be iterable (PIPE mode)"
     for line in proc.stdout:
         line = line.rstrip()
         if not line:
@@ -318,8 +316,14 @@ def _run_cli(
     if proc.returncode != 0:
         errs = [r["error"] for r in results if r.get("error")]
         detail = "; ".join(errs) if errs else "see [tcpp] log lines above"
+        # Tolerate a partial batch: if the CLI emitted some per-file results
+        # before aborting (e.g. one chunk hit the decoder cap), return them so
+        # the caller can accept the good chunks and isolate the bad one.
+        # Only hard-fail when nothing was produced at all.
+        if results:
+            return results, detail
         raise RuntimeError(f"transcribe-cli exited {proc.returncode}: {detail}")
-    return results
+    return results, None
 
 
 def _segs_from_jsonl(obj: dict, offset_s: float = 0.0) -> list[dict]:
@@ -429,8 +433,12 @@ def _transcribe_directory(
 ) -> list[dict]:
     """Transcribe a directory of audio chunks with time offsets.
 
-    The CLI loads the model once and transcribes all files in one batch, which
-    is far cheaper than re-loading per chunk.
+    The CLI loads the model once and transcribes a batch of files. A single
+    pathological chunk (e.g. one exceeding the decoder token cap) aborts the
+    whole CLI process, so we isolate failures: on an aborted batch we accept
+    the chunks that already produced results, retry the failing chunk alone,
+    then continue with the remainder. This guarantees a transcript for every
+    good chunk instead of losing the entire run to one bad chunk.
     """
     audio_files = sorted(
         f for f in input_dir.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
@@ -439,8 +447,8 @@ def _transcribe_directory(
         raise FileNotFoundError(f"No audio files found in: {input_dir}")
     logger.info(f"Found {len(audio_files)} chunks")
 
-    # Convert each chunk to 16k mono WAV and write a batch list. Keep temp dirs
-    # alive for the duration of the CLI run.
+    # Convert every chunk to 16k mono WAV up front; keep temp dirs alive for
+    # the whole transcription so reused paths stay valid across batches.
     tmp_dirs = []
     wav_paths = []
     try:
@@ -449,14 +457,65 @@ def _transcribe_directory(
             tmp_dirs.append(td)
             wav_paths.append(wp)
 
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as bf:
-            for wp in wav_paths:
-                bf.write(str(wp) + "\n")
-            batch_file = Path(bf.name)
-        try:
-            results = _run_cli(cli, model, batch_file, language, logger)
-        finally:
-            batch_file.unlink(missing_ok=True)
+        # Map global index -> raw CLI result object (None if not yet produced).
+        raw_by_index: dict[int, dict] = {}
+        pending: list[int] = list(range(len(audio_files)))
+        skipped = 0
+        while pending:
+            sub = [wav_paths[i] for i in pending]
+            with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as bf:
+                for wp in sub:
+                    bf.write(str(wp) + "\n")
+                batch_file = Path(bf.name)
+            try:
+                results, cli_error = _run_cli(cli, model, batch_file, language, logger)
+            except RuntimeError as e:
+                # CLI produced no results at all for this sub-batch (systemic
+                # failure, not an isolated bad chunk). Accept whatever we already
+                # collected and skip the remaining chunks rather than crash.
+                logger.error(f"  transcribe-cli failed hard on a sub-batch: {e}")
+                skipped += len(pending)
+                break
+            finally:
+                batch_file.unlink(missing_ok=True)
+
+            produced = len(results)
+            for j, obj in enumerate(results):
+                raw_by_index[pending[j]] = obj
+            if cli_error is None:
+                pending.clear()
+                continue
+
+            # CLI aborted partway. Accept everything produced so far; the first
+            # unproduced index is the failing chunk. Retry it alone; if it still
+            # fails, skip it. Then continue with the rest after it.
+            fail_idx = produced  # first pending index with no result
+            if fail_idx < len(pending):
+                bad = pending[fail_idx]
+                logger.warning(
+                    f"  chunk {bad + 1}/{len(audio_files)} ({audio_files[bad].name}) "
+                    f"aborted batch: {cli_error}"
+                )
+                with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as sbf:
+                    sbf.write(str(wav_paths[bad]) + "\n")
+                    single_batch = Path(sbf.name)
+                try:
+                    _, single_err = _run_cli(cli, model, single_batch, language, logger)
+                finally:
+                    single_batch.unlink(missing_ok=True)
+                if single_err is None:
+                    logger.info(f"  chunk {bad + 1} recovered on retry")
+                else:
+                    skipped += 1
+                    logger.error(
+                        f"  skipped chunk {bad + 1}/{len(audio_files)} "
+                        f"({audio_files[bad].name}): {single_err}"
+                    )
+            pending = pending[fail_idx + 1 :]
+
+        if skipped:
+            logger.warning(f"Skipped {skipped} chunk(s) that exceeded the model context cap")
+
     finally:
         for td in tmp_dirs:
             td.cleanup()
@@ -465,12 +524,12 @@ def _transcribe_directory(
     offsets = _calculate_chunk_offsets(audio_files, overlap_secs, logger)
     logger.info(f"Chunk offsets: {offsets[:5]}... (first 5)")
 
-    # Map results back to chunks by file name. The CLI preserves batch order.
+    # Build segments from the per-chunk results we collected.
     all_segments = []
     all_synthetic = True
-    for i, (obj, offset_s) in enumerate(zip(results, offsets, strict=True)):
-        if "error" in obj:
-            logger.error(f"  [{i + 1}/{len(audio_files)}] {audio_files[i].name}: {obj['error']}")
+    for i, offset_s in enumerate(offsets):
+        obj = raw_by_index.get(i)
+        if obj is None or "error" in obj:
             continue
         segs = _segs_from_jsonl(obj, offset_s)
         # Models like cohere/granite may return text but no per-word segments.
