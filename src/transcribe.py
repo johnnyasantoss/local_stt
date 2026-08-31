@@ -10,6 +10,7 @@ from pathlib import Path
 
 from groq import Groq
 
+from src import audio
 from src.srt import segments_to_srt
 
 MAX_FILE_SIZE_MB = 25
@@ -159,30 +160,42 @@ def extract_chunk_start_time(filename: str, default: float = 0.0) -> float:
 
 def merge_chunk_results(
     results: list[ChunkResult],
+    audio_files: list[Path] | None = None,
     chunk_duration: float = 600.0,
     overlap_secs: float = 5.0,
+    logger: logging.Logger | None = None,
 ) -> list[dict]:
-    """Merge transcription results from multiple chunks.
+    """Merge transcription results from multiple chunks into the source timeline.
+
+    Offsets come from the shared src.audio.chunk_offsets helper (derived from
+    the split sidecar) so the Groq cloud path uses the exact same timeline
+    math as the local engine. When ``audio_files`` is omitted (e.g. legacy
+    callers) it falls back to ``i * (chunk_duration - overlap_secs)``.
 
     Args:
-        results: List of ChunkResult from each chunk
-        chunk_duration: Duration of each chunk in seconds
-        overlap_secs: Overlap between chunks in seconds
+        results: List of ChunkResult from each chunk, sorted by chunk name.
+        audio_files: Chunk paths in the same order as ``results`` (used to read
+            the split sidecar for the true per-chunk step).
+        chunk_duration: Fallback nominal chunk duration when no sidecar exists.
+        overlap_secs: Overlap between chunks in seconds.
 
     Returns:
-        Merged and deduplicated list of segments
+        Merged and deduplicated list of segments.
     """
     if not results:
         return []
 
-    all_segments = []
+    if audio_files is not None and len(audio_files) == len(results):
+        offsets = audio.chunk_offsets(audio_files, overlap_secs, logger)
+    else:
+        offsets = [i * (chunk_duration - overlap_secs) for i in range(len(results))]
 
+    all_segments = []
     for i, result in enumerate(results):
         if not result.success or not result.segments:
             continue
 
-        offset = i * (chunk_duration - overlap_secs)
-
+        offset = offsets[i]
         for seg in result.segments:
             adjusted_seg = {
                 "start": seg["start"] + offset,
@@ -371,10 +384,6 @@ def _transcribe_directory(
                     logger.debug(f"Transcribed: {chunk_path.name}")
                 else:
                     logger.warning(f"Failed: {chunk_path.name} - {result.error}")
-                    if fail_fast:
-                        failed = True
-                        break
-
             except Exception as e:
                 logger.error(f"Error processing {chunk_path.name}: {e}")
                 if fail_fast:
@@ -386,7 +395,7 @@ def _transcribe_directory(
 
     results.sort(key=lambda x: x.chunk_path.name)
 
-    merged = merge_chunk_results(results, chunk_duration, overlap_secs)
+    merged = merge_chunk_results(results, audio_files, chunk_duration, overlap_secs, logger)
 
     srt_content = segments_to_srt(merged)
 

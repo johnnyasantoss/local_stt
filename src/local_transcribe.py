@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import src.audio as audio
 from src.audio import get_audio_duration, load_audio_as_wav16k
 from src.srt import deduplicate_segments
 
@@ -294,7 +295,10 @@ def _run_cli(
         errors="replace",
     )
     results = []
-    for line in proc.stdout:
+    stdout = proc.stdout
+    if stdout is None:
+        raise RuntimeError("transcribe-cli produced no stdout stream")
+    for line in stdout:
         line = line.rstrip()
         if not line:
             continue
@@ -409,16 +413,16 @@ def _transcribe_single_file(
     tmp_dir, wav_path = load_audio_as_wav16k(file_path)
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as bf:
-            bf.write(str(wav_path) + "\n")
+            bf.write(str(wav_path))
             batch_file = Path(bf.name)
         try:
-            results = _run_cli(cli, model, batch_file, language, logger)
+            segs_list, _cli_error = _run_cli(cli, model, batch_file, language, logger)
         finally:
             batch_file.unlink(missing_ok=True)
 
-        if not results:
+        if not segs_list:
             return []
-        return _segs_from_jsonl(results[0])
+        return _segs_from_jsonl(segs_list[0])
     finally:
         tmp_dir.cleanup()
 
@@ -556,13 +560,10 @@ def _transcribe_directory(
 def chunk_step_seconds(chunk_duration_s: float, overlap_s: float) -> float:
     """Nominal source advance between consecutive chunk starts.
 
-    A splitter slices the source into ``chunk_duration_s`` windows that
-    overlap by ``overlap_s`` seconds, so each chunk (except the first) starts
-    ``chunk_duration_s - overlap_s`` later than the previous one. This is the
-    timeline step used to place a chunk's transcript segments in the continuous
-    source, and it must match exactly what audio-split used when slicing.
+    Delegates to the shared helper in src.audio so every engine (local and
+    Groq) computes the timeline step identically.
     """
-    return max(0.0, float(chunk_duration_s) - float(overlap_s))
+    return audio.chunk_step_seconds(chunk_duration_s, overlap_s)
 
 
 def _calculate_chunk_offsets(
@@ -570,42 +571,15 @@ def _calculate_chunk_offsets(
     overlap_secs: float,
     logger: logging.Logger,
 ) -> list[float]:
-    """Calculate cumulative time offsets for each chunk.
+    """Cumulative start offsets for each chunk in the continuous source timeline.
 
-    Each Opus chunk is encoded with a fixed pre-skip (312 samples @ 48kHz ~=
-    6.5ms), which ffprobe reports as part of the raw stream duration. Summing
-    those per-chunk decoded durations therefore over-counts every step and
-    drifts the transcript timeline forward of the continuous diarize WAV (which
-    decodes the single source stream once, so it carries only one pre-skip and
-    steps by the true source slice length). Over a 1400-chunk file this reaches
-    ~9s of desync between the displayed timestamp and the audio it seeks to.
-
-    Instead step by the NOMINAL source length the splitter used:
-            chunk_s = int(size_mb * 1024 * 1024 * 8 / bitrate)
-            if max_seconds is not None:
-                chunk_s = int(min(chunk_s, float(max_seconds)))
-            step = chunk_step_seconds(chunk_s, overlap_secs)
-            return [max(0.0, k * step) for k in range(len(audio_files))]
+    Delegates to the single shared implementation in src.audio.chunk_offsets,
+    which steps by the NOMINAL slice length the splitter used (read from the
+    split sidecar) instead of summing each Opus chunk's ffprobe duration. Each
+    Opus chunk carries a 312-sample pre-skip that ffprobe counts in the stream
+    duration, so summing per-chunk durations drifts the transcript timeline
+    forward of the continuous diarize WAV (which decodes the source once).
+    Over a ~1400-chunk file this reaches ~9s of desync between the displayed
+    timestamp and the audio it seeks to.
     """
-    sidecar = audio_files[0].parent / ".split-meta.json" if audio_files else None
-    if sidecar is not None and sidecar.is_file():
-        try:
-            meta = json.loads(sidecar.read_text(encoding="utf-8"))
-            size_mb = float(meta["size_mb"])
-            bitrate = int(meta["bitrate"])
-            max_seconds = meta.get("max_seconds")
-            chunk_s = int(size_mb * 1024 * 1024 * 8 / bitrate)
-            if max_seconds is not None:
-                chunk_s = int(min(chunk_s, float(max_seconds)))
-            step = max(0.0, chunk_s - float(overlap_secs))
-            return [max(0.0, k * step) for k in range(len(audio_files))]
-        except (KeyError, ValueError, json.JSONDecodeError) as e:
-            logger.warning(f"  split sidecar unreadable ({e}); summing chunk durations")
-    offsets = []
-    cumulative = 0.0
-    for i, f in enumerate(audio_files):
-        offsets.append(max(0.0, cumulative))
-        duration_s = get_audio_duration(f)
-        cumulative += duration_s - overlap_secs
-        logger.debug(f"  Chunk {i + 1}: offset={offsets[i]:.1f}s, duration={duration_s:.1f}s")
-    return offsets
+    return audio.chunk_offsets(audio_files, overlap_secs, logger)
