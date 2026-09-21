@@ -384,6 +384,9 @@ def _transcribe_directory(
                     logger.debug(f"Transcribed: {chunk_path.name}")
                 else:
                     logger.warning(f"Failed: {chunk_path.name} - {result.error}")
+                    if fail_fast:
+                        failed = True
+                        break
             except Exception as e:
                 logger.error(f"Error processing {chunk_path.name}: {e}")
                 if fail_fast:

@@ -95,7 +95,16 @@ def chunk_offsets(
             chunk_s = int(size_mb * 1024 * 1024 * 8 / bitrate)
             if max_seconds is not None:
                 chunk_s = int(min(chunk_s, float(max_seconds)))
-            step = chunk_step_seconds(chunk_s, overlap_secs)
+            # The splitter records the overlap it actually used; prefer it so
+            # the step matches how audio-split sliced the source, even when
+            # the caller passes a different (e.g. default) overlap.
+            sidecar_overlap = meta.get("overlap")
+            overlap = (
+                float(sidecar_overlap)
+                if isinstance(sidecar_overlap, (int, float)) and sidecar_overlap >= 0
+                else overlap_secs
+            )
+            step = chunk_step_seconds(chunk_s, overlap)
             return [max(0.0, k * step) for k in range(len(audio_files))]
         except (KeyError, ValueError, json.JSONDecodeError) as e:
             if logger is not None:

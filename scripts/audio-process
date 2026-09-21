@@ -237,8 +237,8 @@ pipeline stages:
         help=(
             "Transcription backend to use. 'groq' sends chunks to the Groq cloud "
             "API (requires GROQ_API_KEY in .env, fast, paid). 'local' runs transcribe.cpp "
-            "(Handy Computer's ggml STT) offline via a built binary; default model "
-            "whisper-large-v3-turbo. Free. (default: groq)"
+            "(Handy Computer's ggml STT) offline via a built binary; no default "
+            "model. Free. (default: groq)"
         ),
     )
     parser.add_argument(
@@ -490,6 +490,7 @@ pipeline stages:
                     trans_args.extend(["--model", args.model])
                 if args.language:
                     trans_args.extend(["--language", args.language])
+                trans_args.extend(["--overlap-secs", str(args.overlap)])
                 result = run_script("audio-transcribe", trans_args, logger)
 
             if result.returncode != 0:
