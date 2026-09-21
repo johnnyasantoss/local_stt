@@ -24,11 +24,6 @@ from src.srt import deduplicate_segments
 # Default transcribe.cpp checkout / build / model locations. Override with
 # env vars for non-standard layouts.
 DEFAULT_CLI = Path("../transcribe.cpp/build/bin/transcribe-cli")
-DEFAULT_MODEL_GLOB = (
-    "~/.cache/huggingface/hub/"
-    "models--handy-computer--whisper-large-v3-turbo-gguf/snapshots/*/"
-    "whisper-large-v3-turbo-Q8_0.gguf"
-)
 
 AUDIO_EXTENSIONS = {".ogg", ".wav", ".mp3", ".m4a", ".flac", ".webm", ".mp4"}
 
@@ -49,7 +44,7 @@ def resolve_model(query: str | None = None) -> Path:
     """Resolve the GGUF model path. Fail fast if missing.
 
     Precedence: explicit query (path or short name) > TCPP_MODEL env.
-    No model defaults to whisper; the caller must supply a model name or set
+    There is no default model: the caller must supply a model name or set
     TCPP_MODEL.
     """
     if query:
@@ -505,11 +500,16 @@ def _transcribe_directory(
                     sbf.write(str(wav_paths[bad]) + "\n")
                     single_batch = Path(sbf.name)
                 try:
-                    _, single_err = _run_cli(cli, model, single_batch, language, logger)
+                    retry_results, single_err = _run_cli(cli, model, single_batch, language, logger)
                 finally:
                     single_batch.unlink(missing_ok=True)
                 if single_err is None:
-                    logger.info(f"  chunk {bad + 1} recovered on retry")
+                    if retry_results:
+                        raw_by_index[bad] = retry_results[0]
+                        logger.info(f"  chunk {bad + 1} recovered on retry")
+                    else:
+                        skipped += 1
+                        logger.error(f"  chunk {bad + 1} retry produced no result; skipping")
                 else:
                     skipped += 1
                     logger.error(
