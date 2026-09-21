@@ -401,10 +401,14 @@ def prompt_speaker_labels(
                 except EOFError:
                     return labels, False
                 if reply == "" and default:
-                    prompt = (
-                        f"  Enter name for {speaker_id} [{default}] (1-3 play, h replay, /more): "
-                    )
-                    continue
+                    # Enter keeps the saved label and advances — but never locks
+                    # in the placeholder "SPEAKER_XX" ids pyannote emits (also
+                    # what the interrupt path saves for unlabeled speakers).
+                    if re.fullmatch(r"SPEAKER_\d+", default):
+                        prompt = f"  Enter name for {speaker_id}: "
+                        continue
+                    labels[speaker_id] = default
+                    break
                 if reply in ("/help", "?"):
                     print(_SPEAKER_HELP)
                     continue
