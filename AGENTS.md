@@ -1,4 +1,4 @@
-# AGENTS.md - Agent Guidelines for Local-SST Project
+# AGENTS.md - Agent Guidelines for Local-STT Project
 
 ## Project Overview
 Audio preprocessing pipeline for transcription using transcribe.cpp (Handy Computer's ggml STT engine) for local inference, with optional Groq cloud API. Focus on Unix philosophy: one focus per script, stdio for piping, minimal dependencies.
@@ -47,7 +47,7 @@ just lint
 
 ## File Structure
 ```
-local-sst/
+local-stt/
 ├── src/
 │   ├── __init__.py
 │   ├── audio.py           # Audio loading utilities

@@ -1,4 +1,4 @@
-# local-sst
+# local-stt
 
 Offline speech-to-text pipeline with speaker diarization. Transcribes audio locally using transcribe.cpp from [Handy.app](https://handy.computer) (ggml-accelerated, Metal/Vulkan/CUDA/CPU), with optional Groq cloud API.
 

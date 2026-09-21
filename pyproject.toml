@@ -1,5 +1,5 @@
 [project]
-name = "local-sst"
+name = "local-stt"
 version = "0.1.0"
 description = "Offline speech-to-text pipeline with speaker diarization"
 requires-python = ">=3.11"

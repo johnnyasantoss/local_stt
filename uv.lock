@@ -1101,7 +1101,7 @@ wheels = [
 ]
 
 [[package]]
-name = "local-sst"
+name = "local-stt"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
