@@ -102,7 +102,7 @@ local-sst/
 - **Handle `KeyboardInterrupt` in interactive prompts.** Save partial progress, write output, and exit cleanly. Users must be able to resume from where they stopped.
 
 ### Transcription
-- **Default engine is `groq`** (cloud). Use `--engine local` for offline transcription via transcribe.cpp (whisper-large-v3-turbo by default).
+- **Default engine is `groq`** (cloud). Use `--engine local` for offline transcription via transcribe.cpp (no default model: pass `--model` or set `TCPP_MODEL`).
 - GGUF models are auto-discovered from the HuggingFace cache (`~/.cache/huggingface/hub/models--handy-computer--*-gguf`) on every run; override model with `-m` or `TCPP_MODEL` env, binary with `TRANSCRIBE_CLI` env. See https://huggingface.co/handy-computer for model details.
 - Diarization caches: WAV conversion (`*.diarize.wav`), diarization results (`*.diarization.json`), speaker labels (`*.speakers.json`). All three are persisted and reused on re-runs.
 

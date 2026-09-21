@@ -34,8 +34,10 @@ cp .env.example .env
 # Full pipeline with local models
 python scripts/audio-process -i meeting.m4a -o output/ --engine local --model whisper-large-v3-turbo -vvv
 
-# Resume a failed run (skips completed stages)
-python scripts/audio-process -i meeting.m4a -o output/ --engine local -c -vvv
+# Resume a failed run (skips completed stages; --model is still required
+# for the transcription stage)
+python scripts/audio-process -i meeting.m4a -o output/ --engine local \
+  --model whisper-large-v3-turbo -c -vvv
 
 # With speaker diarization (interactive, requires terminal)
 # Preferred: use audio-process with --diarize
@@ -75,7 +77,7 @@ python scripts/audio-transcribe -i chunks/ -o output.srt -vvv  # Groq
 | Flag | Description |
 |------|-------------|
 | `--engine local\|groq` | Transcription engine (default: groq) |
-| `--model` | Model name or path, fuzzy-matched for local (e.g. `whisper-large-v3-turbo`) |
+| `--model` | Model name or path, fuzzy-matched for local (e.g. `whisper-large-v3-turbo`); required for `--engine local` |
 | `--diarize` | Run speaker diarization (requires interactive terminal) |
 | `--num-speakers` | Known speaker count (diarization only) |
 | `-c, --continue` | Resume into existing output dir |
@@ -96,14 +98,14 @@ python scripts/audio-transcribe -i chunks/ -o output.srt -vvv  # Groq
 
 ## Local Models
 
-The default model is `whisper-large-v3-turbo` (Q8_0, ~845 MB) from [handy-computer](https://huggingface.co/handy-computer), cached under `~/.cache/huggingface/hub/models--handy-computer--*-gguf/`.
+There is no default local model. Pass `-m/--model` (a GGUF path, or a short name like `cohere` fuzzy-matched against the cache) or set `TCPP_MODEL`. Models come from [handy-computer](https://huggingface.co/handy-computer) and are cached under `~/.cache/huggingface/hub/models--handy-computer--*-gguf/` (e.g. `whisper-large-v3-turbo` Q8_0, ~845 MB).
 
 List cached handy-computer GGUF models:
 ```bash
 python scripts/audio-transcribe-local --list-models
 ```
 
-Select another GGUF with `-m <path-or-name>`, or override defaults via the `TCPP_MODEL` (model path) and `TRANSCRIBE_CLI` (binary) environment variables.
+Select another GGUF with `-m <path-or-name>`, or set the `TCPP_MODEL` (model path) and `TRANSCRIBE_CLI` (binary) environment variables.
 
 ## License
 
