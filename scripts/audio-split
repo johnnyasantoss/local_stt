@@ -2,6 +2,7 @@
 """Split audio into chunks by size with overlap."""
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -11,8 +12,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pydub import AudioSegment
 
-from src.audio import load_audio, get_audio_info
-from src.logging import setup_logging, add_verbose_arg
+from src.audio import get_audio_info, load_audio
+from src.logging import add_verbose_arg, setup_logging
 
 
 def calculate_chunk_duration(
@@ -30,14 +31,21 @@ def main() -> int:
     add_verbose_arg(parser)
     parser.add_argument("-i", "--input", type=Path, required=True, help="Input audio file")
     parser.add_argument("-o", "--output", type=Path, required=True, help="Output directory")
-    parser.add_argument("--size-mb", type=float, default=10, help="Max size per chunk in MiB (default: 10)")
-    parser.add_argument("--overlap", type=int, default=5, help="Overlap in seconds (default: 5)")
+    parser.add_argument(
+        "--size-mb", type=float, default=10, help="Max size per chunk in MiB (default: 10)"
+    )
+    parser.add_argument("--overlap", type=int, default=2, help="Overlap in seconds (default: 2)")
     parser.add_argument("--format", default="ogg", help="Output format (default: ogg)")
     parser.add_argument("--codec", default="libopus", help="Audio codec (default: libopus)")
     parser.add_argument("--bitrate", default="128000", help="Bitrate (default: 128000)")
     parser.add_argument(
-        "-j", "--threads", type=int, default=0,
-        help="Number of threads (0 = all cores, default: 0)"
+        "--max-seconds",
+        type=float,
+        default=None,
+        help="Hard cap on chunk duration in seconds; clamps the --size-mb-derived duration.",
+    )
+    parser.add_argument(
+        "-j", "--threads", type=int, default=0, help="Number of threads (0 = all cores, default: 0)"
     )
 
     args = parser.parse_args()
@@ -55,6 +63,9 @@ def main() -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         chunk_duration_s = calculate_chunk_duration(args.size_mb, int(args.bitrate))
+        if args.max_seconds is not None:
+            chunk_duration_s = int(min(chunk_duration_s, args.max_seconds))
+        chunk_duration_s = max(1, chunk_duration_s)
         chunk_duration_ms = chunk_duration_s * 1000
         overlap_ms = args.overlap * 1000
 
@@ -62,12 +73,22 @@ def main() -> int:
         step_ms = chunk_duration_ms - overlap_ms
 
         if step_ms <= 0:
-            logger.warning(f"Overlap ({args.overlap}s) >= chunk duration ({chunk_duration_s}s), using 0 overlap")
+            logger.warning(
+                f"Overlap ({args.overlap}s) >= chunk duration ({chunk_duration_s}s), using 0 overlap"
+            )
             step_ms = chunk_duration_ms
             overlap_ms = 0
 
-        num_chunks = max(1, (total_ms - overlap_ms) // step_ms + (1 if total_ms % step_ms > overlap_ms else 0))
-        logger.info(f"Splitting into ~{num_chunks} chunks ({args.size_mb}MiB each, {args.overlap}s overlap, threads: {args.threads or 'all'})")
+        num_chunks = max(
+            1, (total_ms - overlap_ms) // step_ms + (1 if total_ms % step_ms > overlap_ms else 0)
+        )
+        cap_note = (
+            f", max-seconds: {args.max_seconds}" if args.max_seconds is not None else ""
+        )
+        logger.info(
+            f"Splitting into ~{num_chunks} chunks ({args.size_mb}MiB each, "
+            f"{args.overlap}s overlap, threads: {args.threads or 'all'}{cap_note})"
+        )
 
         base_name = input_path.stem
         chunks = []
@@ -91,7 +112,9 @@ def main() -> int:
             )
 
             size_mb = output_path.stat().st_size / (1024 * 1024)
-            logger.info(f"  Created: {output_path.name} ({len(chunk)/1000:.1f}s, {size_mb:.2f}MB)")
+            logger.info(
+                f"  Created: {output_path.name} ({len(chunk) / 1000:.1f}s, {size_mb:.2f}MB)"
+            )
 
             chunks.append(output_path)
             chunk_num += 1
@@ -99,6 +122,20 @@ def main() -> int:
 
             if pos_ms >= total_ms:
                 break
+
+        # Persist split parameters so the pipeline can detect stale chunks
+        # when invoked with different size/overlap/max-seconds next time.
+        meta = {
+            "input": str(input_path),
+            "size_mb": args.size_mb,
+            "overlap": args.overlap,
+            "max_seconds": args.max_seconds,
+            "bitrate": int(args.bitrate),
+            "format": args.format,
+            "count": len(chunks),
+        }
+        (output_dir / ".split-meta.json").write_text(json.dumps(meta))
+        logger.info(f"  -> Wrote split metadata: {output_dir / '.split-meta.json'}")
 
         logger.info(f"Split complete: {len(chunks)} chunks")
         print("\n".join(str(p) for p in chunks))

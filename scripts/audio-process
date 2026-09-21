@@ -6,17 +6,39 @@ A stage is skipped if its output file already exists (use --force to re-run all)
 """
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.audio import numeric_sort_key
 from src.config import load_env
 from src.diarize import load_speaker_mapping
-from src.local_transcribe import resolve_model
+from src.local_transcribe import model_audio_window_seconds, resolve_model
 from src.logging import setup_logging
 
+
+def _effective_max_seconds(args) -> float | None:
+    """Resolve the per-model chunk cap that will be applied at split time."""
+    if args.engine != "local":
+        return None
+    try:
+        return model_audio_window_seconds(resolve_model(args.model))
+    except Exception:
+        return None
+
+
+def _split_meta_matches(meta_path: Path, size_mb: float, overlap: int, max_seconds: float | None) -> bool:
+    """True if the cached split parameters match the current request."""
+    try:
+        meta = json.loads(meta_path.read_text())
+    except Exception:
+        return False
+    if meta.get("size_mb") != size_mb or meta.get("overlap") != overlap:
+        return False
+    return meta.get("max_seconds") == max_seconds
 
 def run_script(script: str, args: list, logger, threads: int = 0) -> subprocess.CompletedProcess:
     """Run a script, streaming stdout/stderr to the pipeline log in real-time.
@@ -63,26 +85,27 @@ def validate_args(args, logger) -> bool:
     if args.engine == "groq":
         load_env()
         import os
+
         if not os.getenv("GROQ_API_KEY"):
-            logger.error(
-                "--engine groq requires GROQ_API_KEY. "
-                "Set it in .env or export it."
-            )
+            logger.error("--engine groq requires GROQ_API_KEY. Set it in .env or export it.")
             valid = False
 
     if args.engine == "local":
-        # Validate model early if provided
-        if args.model:
-            try:
-                resolve_model(args.model)
-            except ValueError as e:
-                logger.error(str(e))
-                valid = False
+        # Validate transcribe-cli binary + GGUF model early (fail fast).
+        from src.local_transcribe import resolve_cli, resolve_model
+
+        try:
+            resolve_cli()
+            resolve_model(args.model)
+        except (FileNotFoundError, ValueError) as e:
+            logger.error(str(e))
+            valid = False
 
         # HF_TOKEN required if diarize requested
         if args.diarize:
             load_env()
             import os
+
             if not os.getenv("HF_TOKEN"):
                 logger.error(
                     "--diarize requires HF_TOKEN. "
@@ -114,7 +137,7 @@ pipeline stages:
   2. Enhance     - voice band isolation (highpass/lowpass)
   3. Convert     - resample to 16kHz mono Opus
   4. Split       - chunk by size with overlap
-  5. Transcribe  - Groq cloud or local ONNX model
+  5. Transcribe  - Groq cloud or local transcribe.cpp (ggml)
 """
 
     parser = argparse.ArgumentParser(
@@ -127,7 +150,9 @@ pipeline stages:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "-v", "-vv", "-vvv",
+        "-v",
+        "-vv",
+        "-vvv",
         action="count",
         default=0,
         help=(
@@ -138,7 +163,8 @@ pipeline stages:
         ),
     )
     parser.add_argument(
-        "-i", "--input",
+        "-i",
+        "--input",
         type=Path,
         required=True,
         help=(
@@ -148,7 +174,8 @@ pipeline stages:
         ),
     )
     parser.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         type=Path,
         required=True,
         help=(
@@ -172,12 +199,12 @@ pipeline stages:
     parser.add_argument(
         "--overlap",
         type=int,
-        default=5,
+        default=2,
         help=(
-            "Overlap in seconds between consecutive audio chunks during the "
-            "split stage. Prevents words from being cut off at chunk boundaries. "
-            "Higher values give more context but increase total audio volume "
-            "(and API cost for Groq). (default: 5)"
+            "Seconds of overlap between consecutive chunks (default: 2). "
+            "Overlap duplicates audio the model re-transcribes; 2s is enough "
+            "for cohere/whisper 15-65s windows to not drop mid-boundary words "
+            "while cutting redundant transcription versus the old 5s default."
         ),
     )
     parser.add_argument(
@@ -192,7 +219,8 @@ pipeline stages:
         ),
     )
     parser.add_argument(
-        "-j", "--threads",
+        "-j",
+        "--threads",
         type=int,
         default=0,
         help=(
@@ -208,9 +236,9 @@ pipeline stages:
         default="groq",
         help=(
             "Transcription backend to use. 'groq' sends chunks to the Groq cloud "
-            "API (requires GROQ_API_KEY in .env, fast, paid). 'local' runs ONNX "
-            "models offline via onnx-asr (requires model download on first use, "
-            "slower, free). (default: groq)"
+            "API (requires GROQ_API_KEY in .env, fast, paid). 'local' runs transcribe.cpp "
+            "(Handy Computer's ggml STT) offline via a built binary; no default "
+            "model. Free. (default: groq)"
         ),
     )
     parser.add_argument(
@@ -219,17 +247,20 @@ pipeline stages:
         help=(
             "Model name for the chosen engine. For --engine groq: any "
             "Groq-supported model (e.g. distil-whisper-large-v3-en, "
-            "whisper-large-v3). For --engine local: an ONNX model name "
-            "discovered from Handy.app's models directory. If omitted, the "
-            "engine's default model is used. (default: engine default model)"
+            "whisper-large-v3). For --engine local: a GGUF path or HF cache short "
+            "name; use "
+            "`scripts/audio-transcribe-local --list-models` to list cached handy-computer "
+            "GGUFs. Required for --engine local (no default model). For groq it "
+            "defaults to the API's default if omitted. "
         ),
     )
     parser.add_argument(
         "--language",
         default=None,
         help=(
-            "ISO 639-1 language code (e.g. en, es, fr, de) hinting the "
-            "transcription engine. Improves accuracy and speed when the language "
+            "ISO 639-1 two-letter code (e.g. en, es, fr, pt) hinting the "
+            "transcription engine. Regional variants like pt-BR are not supported; "
+            "use the base code (pt). Improves accuracy and speed when the language "
             "is known. If omitted, the engine auto-detects the language. "
             "(default: auto-detect)"
         ),
@@ -269,7 +300,8 @@ pipeline stages:
         ),
     )
     parser.add_argument(
-        "-c", "--continue",
+        "-c",
+        "--continue",
         action="store_true",
         dest="continue_run",
         help=(
@@ -361,15 +393,50 @@ pipeline stages:
 
         # Stage 4: Split
         split_dir = output_dir / "chunks"
-        if split_dir.exists() and any(split_dir.iterdir()) and not args.force:
-            chunk_files = sorted(split_dir.glob("*"))
+        split_meta = split_dir / ".split-meta.json"
+        split_cached = (
+            split_dir.exists()
+            and any(split_dir.glob("*.ogg"))
+            and split_meta.is_file()
+            and _split_meta_matches(
+                split_meta,
+                size_mb=args.size_mb,
+                overlap=args.overlap,
+                max_seconds=_effective_max_seconds(args),
+            )
+        )
+        if split_cached:
+            chunk_files = sorted(split_dir.glob("*.ogg"), key=numeric_sort_key)
             logger.info(f"[4/5] Split: cached ({len(chunk_files)} chunks)")
         else:
-            logger.info("[4/5] Splitting by size...")
+            if split_dir.exists() and any(split_dir.glob("*.ogg")):
+                logger.info("[4/5] Split: params changed, re-splitting...")
+                for stale in split_dir.glob("*.ogg"):
+                    stale.unlink()
+            else:
+                logger.info("[4/5] Splitting by size...")
+            split_args = [
+                "-i",
+                str(conv_out),
+                "-o",
+                str(split_dir),
+                "--size-mb",
+                str(args.size_mb),
+                "--overlap",
+                str(args.overlap),
+            ]
+            if args.engine == "local":
+                try:
+                    cap = model_audio_window_seconds(resolve_model(args.model))
+                except Exception as e:
+                    cap = None
+                    logger.debug(f"Could not determine model audio window: {e}")
+                if cap is not None:
+                    split_args += ["--max-seconds", str(cap)]
+            split_args += ["-v" * args.v]
             result = run_script(
                 "audio-split",
-                ["-i", str(conv_out), "-o", str(split_dir), "--size-mb", str(args.size_mb),
-                 "--overlap", str(args.overlap), "-v" * args.v],
+                split_args,
                 logger,
                 args.threads,
             )
@@ -396,8 +463,10 @@ pipeline stages:
 
             if args.engine == "local":
                 local_args = [
-                    "-i", str(split_dir),
-                    "-o", str(transcription_path),
+                    "-i",
+                    str(split_dir),
+                    "-o",
+                    str(transcription_path),
                     "-v" * args.v,
                 ]
                 if args.model:
@@ -411,18 +480,21 @@ pipeline stages:
                 result = run_script("audio-transcribe-local", local_args, logger)
             else:
                 trans_args = [
-                    "-i", str(split_dir),
-                    "-o", str(transcription_path),
+                    "-i",
+                    str(split_dir),
+                    "-o",
+                    str(transcription_path),
                     "-v" * args.v,
                 ]
                 if args.model:
                     trans_args.extend(["--model", args.model])
                 if args.language:
                     trans_args.extend(["--language", args.language])
+                trans_args.extend(["--overlap-secs", str(args.overlap)])
                 result = run_script("audio-transcribe", trans_args, logger)
 
             if result.returncode != 0:
-                logger.error(f"transcribe failed: {result.stderr}")
+                logger.error("transcribe failed (see log above)")
                 return 1
             logger.info(f"  -> {transcription_path}")
 
@@ -442,6 +514,7 @@ pipeline stages:
         # Clean intermediates only if --clean-temp, even on error/kill
         if args.clean_temp:
             import shutil
+
             shutil.rmtree(inter_dir, ignore_errors=True)
             logger.info("  Cleaned intermediates")
 

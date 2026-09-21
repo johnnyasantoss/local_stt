@@ -1,6 +1,5 @@
 """SRT file generation utilities."""
 
-import math
 import re
 from dataclasses import dataclass
 
@@ -128,7 +127,7 @@ def parse_srt(srt_content: str) -> list[dict]:
     segments = []
 
     for block in blocks:
-        lines = [l for l in block.strip().split("\n") if l.strip()]
+        lines = [line for line in block.strip().split("\n") if line.strip()]
         if len(lines) < 3:
             continue
 

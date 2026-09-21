@@ -3,14 +3,15 @@
 import json
 import logging
 import os
-import tempfile
+import typing as _typing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
 from groq import Groq
 
-from src.srt import deduplicate_segments, segments_to_srt
+from src import audio
+from src.srt import segments_to_srt
 
 MAX_FILE_SIZE_MB = 25
 DEFAULT_MODEL = "whisper-large-v3-turbo"
@@ -49,10 +50,10 @@ def validate_file_size(path: Path, max_mb: float = MAX_FILE_SIZE_MB) -> None:
 
 
 def get_audio_files_from_dir(directory: Path) -> list[Path]:
-    """Get all audio files from directory, sorted by name."""
+    """Get all audio files from directory, in numeric filename order."""
     audio_extensions = {".ogg", ".wav", ".mp3", ".m4a", ".flac", ".webm"}
     files = [f for f in directory.iterdir() if f.is_file() and f.suffix.lower() in audio_extensions]
-    return sorted(files, key=lambda x: x.name)
+    return sorted(files, key=audio.numeric_sort_key)
 
 
 def find_existing_transcripts(directory: Path, prefix: str) -> set[Path]:
@@ -84,7 +85,7 @@ def transcribe_chunk(
                 segments=data.get("segments", []),
                 success=True,
             )
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
 
     validate_file_size(chunk_path)
@@ -94,14 +95,16 @@ def transcribe_chunk(
             response = client.audio.transcriptions.create(
                 file=(chunk_path.name, f.read()),
                 model=model,
-                language=language,
+                **({"language": language} if language else {}),
                 response_format="verbose_json",
                 timestamp_granularities=["segment"],
             )
 
-        segments = []
+        segments: list[dict] = []
         if hasattr(response, "segments") and response.segments:
-            for seg in response.segments:
+            segs: list[dict] = list(_typing.cast(_typing.Iterable, response.segments))
+
+            for seg in segs:
                 if isinstance(seg, dict):
                     segments.append(
                         {
@@ -113,12 +116,11 @@ def transcribe_chunk(
                 else:
                     segments.append(
                         {
-                            "start": seg.start,
-                            "end": seg.end,
-                            "text": seg.text,
+                            "start": seg.start,  # type: ignore[unresolved-attribute]  # type: ignore[unresolved-attribute]
+                            "end": seg.end,  # type: ignore[unresolved-attribute]  # type: ignore[unresolved-attribute]
+                            "text": seg.text,  # type: ignore[unresolved-attribute]  # type: ignore[unresolved-attribute]
                         }
                     )
-
         result_data = {
             "chunk": str(chunk_path),
             "start_time": 0.0,
@@ -158,30 +160,42 @@ def extract_chunk_start_time(filename: str, default: float = 0.0) -> float:
 
 def merge_chunk_results(
     results: list[ChunkResult],
+    audio_files: list[Path] | None = None,
     chunk_duration: float = 600.0,
     overlap_secs: float = 5.0,
+    logger: logging.Logger | None = None,
 ) -> list[dict]:
-    """Merge transcription results from multiple chunks.
+    """Merge transcription results from multiple chunks into the source timeline.
+
+    Offsets come from the shared src.audio.chunk_offsets helper (derived from
+    the split sidecar) so the Groq cloud path uses the exact same timeline
+    math as the local engine. When ``audio_files`` is omitted (e.g. legacy
+    callers) it falls back to ``i * (chunk_duration - overlap_secs)``.
 
     Args:
-        results: List of ChunkResult from each chunk
-        chunk_duration: Duration of each chunk in seconds
-        overlap_secs: Overlap between chunks in seconds
+        results: List of ChunkResult from each chunk, sorted by chunk name.
+        audio_files: Chunk paths in the same order as ``results`` (used to read
+            the split sidecar for the true per-chunk step).
+        chunk_duration: Fallback nominal chunk duration when no sidecar exists.
+        overlap_secs: Overlap between chunks in seconds.
 
     Returns:
-        Merged and deduplicated list of segments
+        Merged and deduplicated list of segments.
     """
     if not results:
         return []
 
-    all_segments = []
+    if audio_files is not None and len(audio_files) == len(results):
+        offsets = audio.chunk_offsets(audio_files, overlap_secs, logger)
+    else:
+        offsets = [i * (chunk_duration - overlap_secs) for i in range(len(results))]
 
+    all_segments = []
     for i, result in enumerate(results):
         if not result.success or not result.segments:
             continue
 
-        offset = i * (chunk_duration - overlap_secs)
-
+        offset = offsets[i]
         for seg in result.segments:
             adjusted_seg = {
                 "start": seg["start"] + offset,
@@ -295,20 +309,26 @@ def _transcribe_single_file(
         response = client.audio.transcriptions.create(
             file=(input_path.name, f.read()),
             model=model,
-            language=language,
+            **({"language": language} if language else {}),
             response_format="verbose_json",
             timestamp_granularities=["segment"],
         )
 
-    segments = []
+    segments: list[dict] = []
     if hasattr(response, "segments") and response.segments:
         segments = [
             {
-                "start": seg.start,
-                "end": seg.end,
-                "text": seg.text,
+                "start": _typing.cast(dict, seg).get("start", 0.0)
+                if isinstance(seg, dict)
+                else seg.start,  # noqa: F821
+                "end": _typing.cast(dict, seg).get("end", 0.0)
+                if isinstance(seg, dict)
+                else seg.end,  # noqa: F821
+                "text": _typing.cast(dict, seg).get("text", "")
+                if isinstance(seg, dict)
+                else seg.text,  # noqa: F821
             }
-            for seg in response.segments
+            for seg in _typing.cast(_typing.Iterable, response.segments)
         ]
 
     srt_content = segments_to_srt(segments)
@@ -367,7 +387,6 @@ def _transcribe_directory(
                     if fail_fast:
                         failed = True
                         break
-
             except Exception as e:
                 logger.error(f"Error processing {chunk_path.name}: {e}")
                 if fail_fast:
@@ -379,7 +398,7 @@ def _transcribe_directory(
 
     results.sort(key=lambda x: x.chunk_path.name)
 
-    merged = merge_chunk_results(results, chunk_duration, overlap_secs)
+    merged = merge_chunk_results(results, audio_files, chunk_duration, overlap_secs, logger)
 
     srt_content = segments_to_srt(merged)
 

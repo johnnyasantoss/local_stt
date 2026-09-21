@@ -1,452 +1,570 @@
-"""Local ONNX transcription engine using Handy.app models."""
+"""Local transcription via transcribe.cpp (Handy Computer's ggml STT engine).
+
+transcribe.cpp is the new Handy Computer release that replaces the previous
+ONNX transcription path. It runs GGUF models on Metal (Apple Silicon), Vulkan,
+CUDA, and a tinyBLAS-accelerated CPU path, and is substantially faster than
+ONNX on the same hardware. Whisper-large-v3-turbo at Q8_0 on an M-series Mac
+runs ~55-60x realtime and emits native segment timestamps absolute to the
+input audio (no external VAD, no manual chunking -- Whisper 30s-windows long
+audio internally).
+"""
 
 import json
 import logging
+import os
+import struct
+import subprocess
 import tempfile
 from pathlib import Path
 
-import onnx_asr
-from pydub import AudioSegment
-
-from src.audio import detect_format
+import src.audio as audio
+from src.audio import get_audio_duration, load_audio_as_wav16k
 from src.srt import deduplicate_segments
 
-HANDY_MODELS_DIR = Path.home() / "Library/Application Support/com.pais.handy/models"
-SUPPORTED_MODEL_TYPES = {"nemo-conformer-tdt", "nemo-conformer-aed"}
+# Default transcribe.cpp checkout / build / model locations. Override with
+# env vars for non-standard layouts.
+DEFAULT_CLI = Path("../transcribe.cpp/build/bin/transcribe-cli")
+
 AUDIO_EXTENSIONS = {".ogg", ".wav", ".mp3", ".m4a", ".flac", ".webm", ".mp4"}
-SAMPLE_RATE = 16000
+
+
+def resolve_cli() -> Path:
+    """Resolve the transcribe-cli binary path. Fail fast if missing."""
+    p = Path(os.environ.get("TRANSCRIBE_CLI", DEFAULT_CLI)).expanduser()
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"transcribe-cli not found at {p}. "
+            "Build transcribe.cpp (cmake -B build && cmake --build build) "
+            "or set TRANSCRIBE_CLI to the binary path."
+        )
+    return p
+
+
+def resolve_model(query: str | None = None) -> Path:
+    """Resolve the GGUF model path. Fail fast if missing.
+
+    Precedence: explicit query (path or short name) > TCPP_MODEL env.
+    There is no default model: the caller must supply a model name or set
+    TCPP_MODEL.
+    """
+    if query:
+        cand = Path(query).expanduser()
+        if cand.is_file():
+            return cand
+        # short name (e.g. "cohere") -> fuzzy search HF cache folders + gguf names
+        short = query.removesuffix(".gguf").lower()
+        hub = Path("~/.cache/huggingface/hub").expanduser()
+        matches = []
+        for gguf in sorted(hub.glob("models--handy-computer--*-gguf/snapshots/*/*.gguf")):
+            folder_short = gguf.parent.parent.parent.name
+            folder_short = folder_short.removeprefix("models--handy-computer--").removesuffix(
+                "-gguf"
+            )
+            if short in folder_short.lower() or short in gguf.stem.lower():
+                matches.append(gguf)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            listing = "\n  ".join(str(m) for m in matches)
+            raise ValueError(
+                f"Model query '{query}' is ambiguous; multiple matches found:\n  {listing}\n"
+                "Pass a more specific query or the full path to the .gguf file."
+            )
+        raise FileNotFoundError(
+            f"Model '{query}' not found in HF cache (no folder/gguf name match)."
+        )
+    env_model = os.environ.get("TCPP_MODEL")
+    if env_model:
+        cand = Path(env_model).expanduser()
+        if not cand.is_file():
+            raise FileNotFoundError(f"TCPP_MODEL={env_model} does not exist.")
+        return cand
+
+    raise ValueError(
+        "No model specified. Pass a model name (e.g. 'cohere-transcribe-03-2026') "
+        "or set TCPP_MODEL to the .gguf path."
+    )
+
+
+class _GGUFReader:
+    """Sequential cursor over a binary GGUF stream (read-past, no buffering)."""
+
+    def __init__(self, f):
+        self.f = f
+
+    def _read(self, n: int) -> bytes:
+        data = self.f.read(n)
+        if len(data) < n:
+            raise EOFError("unexpected end of GGUF file")
+        return data
+
+    def u8(self) -> int:
+        return self._read(1)[0]
+
+    def u16(self) -> int:
+        return struct.unpack("<H", self._read(2))[0]
+
+    def u32(self) -> int:
+        return struct.unpack("<I", self._read(4))[0]
+
+    def u64(self) -> int:
+        return struct.unpack("<Q", self._read(8))[0]
+
+    def f32(self) -> float:
+        return struct.unpack("<f", self._read(4))[0]
+
+    def string(self) -> str:
+        n = self.u64()
+        return self._read(n).decode("utf-8", "replace")
+
+
+# GGUF metadata value type codes.
+_GGUF_U8 = 0
+_GGUF_I8 = 1
+_GGUF_U16 = 2
+_GGUF_I16 = 3
+_GGUF_U32 = 4
+_GGUF_I32 = 5
+_GGUF_F32 = 6
+_GGUF_BOOL = 7
+_GGUF_STRING = 8
+_GGUF_ARRAY = 9
+
+
+def _read_gguf_value(reader: _GGUFReader, value_type: int) -> object:
+    """Read one GGUF metadata value of the given type, advancing the cursor."""
+    if value_type == _GGUF_U8:
+        return reader.u8()
+    if value_type == _GGUF_I8:
+        return struct.unpack("<b", reader._read(1))[0]
+    if value_type == _GGUF_U16:
+        return reader.u16()
+    if value_type == _GGUF_I16:
+        return struct.unpack("<h", reader._read(2))[0]
+    if value_type == _GGUF_U32:
+        return reader.u32()
+    if value_type == _GGUF_I32:
+        return struct.unpack("<i", reader._read(4))[0]
+    if value_type == _GGUF_F32:
+        return reader.f32()
+    if value_type == _GGUF_BOOL:
+        return reader.u8() != 0
+    if value_type == _GGUF_STRING:
+        return reader.string()
+    if value_type == _GGUF_ARRAY:
+        sub_type = reader.u32()
+        count = reader.u64()
+        return [_read_gguf_value(reader, sub_type) for _ in range(count)]
+    raise ValueError(f"unknown GGUF value type {value_type}")
+
+
+def read_gguf_metadata(path: Path, wanted: set[str]) -> dict[str, object]:
+    """Read ONLY the requested GGUF metadata keys, discarding all others.
+
+    Reads past (but does not store) unwanted values, so large arrays such as
+    tokenizer.ggml.tokens are skipped without being materialized. Raises on a
+    malformed header or any parse error.
+    """
+    result: dict[str, object] = {}
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise ValueError(f"not a GGUF file: {path}")
+        reader = _GGUFReader(f)
+        version = reader.u32()
+        if version not in (2, 3):
+            raise ValueError(f"unsupported GGUF version {version}")
+        reader.u64()  # tensor_count
+        n_kv = reader.u64()
+        for _ in range(n_kv):
+            key = reader.string()
+            value_type = reader.u32()
+            if key in wanted and key not in result:
+                result[key] = _read_gguf_value(reader, value_type)
+            else:
+                # Read and discard unwanted values (large arrays are skipped here).
+                _read_gguf_value(reader, value_type)
+    return result
+
+
+# Maximum audio clip window (seconds) per GGUF architecture. None means no
+# per-file cap (the engine chunks long audio internally).
+#   cohere_asr: 30s is safely under its 50s positional limit
+#     (pos_emb_max_len 5000 * hop 160 / sample_rate 16000) and the model card's
+#     ~30-35s clip window.
+#   whisper: None (transcribe.cpp chunks 30s windows internally).
+GGUF_ARCH_MAX_AUDIO_SEC: dict[str, float | None] = {
+    "cohere_asr": 15.0,
+    "whisper": None,
+}
+
+
+def model_audio_window_seconds(path: Path) -> float | None:
+    """Return the per-file audio cap (seconds) for a GGUF model, else None.
+
+    Detects the architecture from GGUF metadata and maps it to the max clip
+    window. Never raises: any parse error yields None (no cap applied).
+    """
+    try:
+        meta = read_gguf_metadata(path, {"general.architecture"})
+        arch = meta.get("general.architecture")
+        if not isinstance(arch, str):
+            return None
+        return GGUF_ARCH_MAX_AUDIO_SEC.get(arch, None)
+    except Exception:
+        return None
 
 
 def discover_models() -> list[dict]:
-    """Scan Handy models dir for supported ONNX models.
+    """Scan the HuggingFace cache for handy-computer GGUF models.
 
-    Returns list of {name, path, model_type, size_mb} dicts.
+    Returns a list of {name, path, size_mb} dicts, one per GGUF file found
+    under ~/.cache/huggingface/hub/models--handy-computer--*-gguf/snapshots/*.
     """
+    hub = Path("~/.cache/huggingface/hub").expanduser()
+    if not hub.is_dir():
+        return []
+
     models = []
-    if not HANDY_MODELS_DIR.is_dir():
-        return models
-
-    for subdir in sorted(HANDY_MODELS_DIR.iterdir()):
-        if not subdir.is_dir():
+    for repo in sorted(hub.glob("models--handy-computer--*-gguf")):
+        short = repo.name.removeprefix("models--handy-computer--").removesuffix("-gguf")
+        snapshots = repo / "snapshots"
+        if not snapshots.is_dir():
             continue
-
-        config_path = subdir / "config.json"
-        if not config_path.exists():
-            continue
-
-        try:
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            continue
-
-        model_type = config.get("model_type", "")
-        if model_type not in SUPPORTED_MODEL_TYPES:
-            continue
-
-        encoder = _find_file(subdir, "encoder-model*.onnx")
-        if encoder is None:
-            continue
-
-        size_mb = sum(f.stat().st_size for f in subdir.iterdir() if f.suffix == ".onnx") / (
-            1024 * 1024
-        )
-
-        models.append(
-            {
-                "name": subdir.name,
-                "path": subdir,
-                "model_type": model_type,
-                "size_mb": size_mb,
-            }
-        )
-
+        for snap in sorted(snapshots.iterdir()):
+            if not snap.is_dir():
+                continue
+            for gguf in sorted(snap.glob("*.gguf")):
+                models.append(
+                    {
+                        "name": short,
+                        "path": gguf,
+                        "quant": _quant_from_name(gguf.name),
+                        "size_mb": gguf.stat().st_size / (1024 * 1024),
+                    }
+                )
     return models
 
 
-def resolve_model(query: str) -> dict:
-    """Fuzzy-match model query against discovered models.
+def _quant_from_name(name: str) -> str:
+    """Extract quantization tag from GGUF filename (e.g. 'Q8_0', 'F16')."""
+    stem = name.removesuffix(".gguf")
+    parts = stem.split("-")
+    for p in parts:
+        if p.startswith(("Q", "F", "I")):
+            return p
+    return "F32"
 
-    1. Exact name match
-    2. Case-insensitive substring match
-    3. Direct path if valid
+
+def _run_cli(
+    cli: Path,
+    model: Path,
+    batch_file: Path,
+    language: str | None,
+    logger: logging.Logger,
+) -> tuple[list[dict], str | None]:
+    """Run transcribe-cli in batch-jsonl mode and return parsed per-file results.
+
+    Returns a list of dicts: {"file": str, "segments": [...], "text": str, "error": str?}.
+    The CLI loads the model once and reuses it across all files in the batch.
     """
-    models = discover_models()
+    cmd = [
+        str(cli),
+        "-m",
+        str(model),
+        "--timestamps",
+        "auto",
+        "--batch",
+        str(batch_file),
+        "--batch-jsonl",
+    ]
+    if language:
+        cmd += ["-l", language]
 
-    for m in models:
-        if m["name"] == query:
-            return m
-
-    query_lower = query.lower()
-    for m in models:
-        if query_lower in m["name"].lower():
-            return m
-
-    path = Path(query)
-    if path.is_dir():
-        config_path = path / "config.json"
-        if config_path.exists():
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            model_type = config.get("model_type", "")
-            if model_type in SUPPORTED_MODEL_TYPES:
-                size_mb = sum(f.stat().st_size for f in path.iterdir() if f.suffix == ".onnx") / (
-                    1024 * 1024
-                )
-                return {
-                    "name": path.name,
-                    "path": path,
-                    "model_type": model_type,
-                    "size_mb": size_mb,
-                }
-
-    names = [m["name"] for m in models]
-    raise ValueError(f"Model '{query}' not found. Available: {', '.join(names)}")
-
-
-def _find_file(directory: Path, pattern: str) -> Path | None:
-    """Find a file matching glob pattern in directory."""
-    matches = list(directory.glob(pattern))
-    onnx_files = [m for m in matches if m.is_file() and ".onnx.data" not in m.suffix]
-    return onnx_files[0] if onnx_files else None
-
-
-def _get_quantization(model_dir: Path) -> str | None:
-    """Detect quantization level from model files."""
-    for f in model_dir.iterdir():
-        if "int8" in f.name and f.suffix == ".onnx":
-            return "int8"
-        if "int4" in f.name and f.suffix == ".onnx":
-            return "int4"
-    return None
-
-
-def _is_quantized(model_dir: Path) -> bool:
-    """Check if model has quantized files (int8/int4 in filename)."""
-    return _get_quantization(model_dir) is not None
-
-
-def load_model(model_info: dict, providers: list | None = None, logger=None):
-    """Load ONNX ASR model via onnx-asr.
-
-    Uses CoreML MLProgram format with GPU compute units for the encoder/decoder,
-    and numpy preprocessors to avoid CoreML incompatibility with the preprocessor model.
-
-    Args:
-        model_info: From resolve_model() or discover_models()
-        providers: ONNX Runtime providers. Auto-detects CoreML MLProgram on macOS.
-        logger: Logger for reporting active providers
-    """
-    if providers is None:
-        providers = _get_providers()
-
-    quantization = (
-        _get_quantization(model_info["path"]) if _is_quantized(model_info["path"]) else None
+    logger.info(f"Running transcribe-cli: {' '.join(cmd[:3])} ... --batch {batch_file.name}")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
-
-    if logger:
-        logger.info(f"ONNX providers: {providers}")
-        logger.info(f"Quantization: {quantization or 'none'}")
-
-    model = onnx_asr.load_model(
-        model_info["model_type"],
-        str(model_info["path"]),
-        quantization=quantization,
-        providers=providers,
-        preprocessor_config={"use_numpy_preprocessors": True, "max_concurrent_workers": 1},
-    )
-
-    if logger:
-        import onnxruntime as ort
-
+    results = []
+    stdout = proc.stdout
+    if stdout is None:
+        raise RuntimeError("transcribe-cli produced no stdout stream")
+    for line in stdout:
+        line = line.rstrip()
+        if not line:
+            continue
+        # The CLI emits JSONL on stdout interleaved with [info]/[debug] log lines on
+        # stderr-merged. Only lines starting with '{' are JSONL.
+        if not line.startswith("{"):
+            logger.debug(f"[tcpp] {line}")
+            continue
         try:
-            used = ort.get_available_providers()
-            logger.info(f"Available providers: {used}")
-        except Exception:
-            pass
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            logger.debug(f"[tcpp] non-json: {line}")
+            continue
+        if obj.get("type") == "batch_header":
+            logger.info(f"[tcpp] model loaded in {obj.get('load_ms', 0):.0f} ms")
+            continue
+        results.append(obj)
+    proc.wait()
+    if proc.returncode != 0:
+        errs = [r["error"] for r in results if r.get("error")]
+        detail = "; ".join(errs) if errs else "see [tcpp] log lines above"
+        # Tolerate a partial batch: if the CLI emitted some per-file results
+        # before aborting (e.g. one chunk hit the decoder cap), return them so
+        # the caller can accept the good chunks and isolate the bad one.
+        # Only hard-fail when nothing was produced at all.
+        if results:
+            return results, detail
+        raise RuntimeError(f"transcribe-cli exited {proc.returncode}: {detail}")
+    return results, None
 
-    return model
+
+def _segs_from_jsonl(obj: dict, offset_s: float = 0.0) -> list[dict]:
+    """Convert one JSONL per-file object to our segment schema."""
+    out = []
+    for s in obj.get("segments", []):
+        out.append(
+            {
+                "start": s["t0_ms"] / 1000.0 + offset_s,
+                "end": s["t1_ms"] / 1000.0 + offset_s,
+                "text": s.get("text", ""),
+            }
+        )
+    return out
 
 
-def load_vad():
-    """Load Silero VAD via onnx-asr."""
-    return onnx_asr.load_vad("silero")
+def _normalize_language(language: str | None, logger: logging.Logger) -> str | None:
+    """Normalize a BCP-47-ish tag to the base code transcribe-cli expects.
 
-
-def _get_providers() -> list:
-    """Auto-detect best ONNX Runtime providers.
-
-    On macOS, CPU-only is faster than CoreML for NeMo Conformer models
-    because CoreML only supports ~47% of model nodes, causing expensive
-    CPU↔GPU partition switching. CPU uses Apple's BNNS/AMX acceleration
-    via the Accelerate framework which is highly optimized for these ops.
+    transcribe-cli accepts ISO 639-1/639-3 base codes (e.g. 'pt', 'en', 'yue');
+    regional variants like 'pt-BR' or 'en-US' are rejected with 'unsupported
+    language'. Strip the region subtag and warn.
     """
-    import onnxruntime as ort
-
-    available = ort.get_available_providers()
-    if "CUDAExecutionProvider" in available:
-        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    return ["CPUExecutionProvider"]
-
-
-def _load_audio_as_wav16k(file_path: Path) -> tuple[tempfile.TemporaryDirectory, Path]:
-    """Convert any audio format to 16kHz mono WAV.
-
-    Returns (temp_dir, wav_path). Caller must keep temp_dir alive while using wav_path.
-    temp_dir auto-cleans on garbage collection or explicit cleanup.
-    """
-    audio = AudioSegment.from_file(str(file_path), format=detect_format(file_path))
-    audio = audio.set_frame_rate(SAMPLE_RATE).set_channels(1)
-
-    tmp_dir = tempfile.TemporaryDirectory()
-    wav_path = Path(tmp_dir.name) / "audio.wav"
-    audio.export(str(wav_path), format="wav")
-    return tmp_dir, wav_path
+    if not language:
+        return None
+    short = language.replace("_", "-").split("-")[0]
+    if short != language:
+        logger.warning(
+            f"Language '{language}' normalized to '{short}' "
+            f"(transcribe-cli accepts base codes only, not regional tags)"
+        )
+    return short
 
 
 def transcribe_local(
     input_path: Path,
-    model_query: str,
+    model_query: str | None = None,
     language: str | None = None,
-    vad_threshold: float = 0.5,
+    vad_threshold: float = 0.5,  # ignored: Whisper has internal VAD
     overlap_secs: float = 5.0,
-    parallel: int = 1,
+    parallel: int = 1,  # ignored: CLI loads model once and serializes files
     logger: logging.Logger | None = None,
 ) -> list[dict]:
-    """Transcribe audio using local ONNX model with VAD always on.
+    """Transcribe audio via transcribe.cpp. Returns [{"start","end","text"}].
 
     Args:
-        input_path: Single audio file or directory of chunks
-        model_query: Fuzzy model name
-        language: Language code (required for Canary AED, optional for Parakeet TDT)
-        vad_threshold: VAD speech detection threshold
-        overlap_secs: Overlap between chunks for merging
-        parallel: Number of parallel workers for chunk directory
-        logger: Logger instance
+        input_path: Single audio file or directory of chunks.
+        model_query: GGUF path or short model name. Required: no default model.
+        language: ISO 639-1 hint. None = auto-detect.
+        vad_threshold: ignored (Whisper internal VAD). Kept for call-site compat.
+        overlap_secs: overlap between chunks for offset math (chunk-dir mode).
+        parallel: ignored (CLI serializes). Kept for call-site compat.
+        logger: Logger instance.
 
     Returns:
-        Segments: [{"start": float, "end": float, "text": str}]
+        Segments [{"start": float, "end": float, "text": str}].
     """
     if logger is None:
         logger = logging.getLogger(__name__)
+    cli = resolve_cli()
+    model = resolve_model(model_query)
+    logger.info(f"Using transcribe.cpp: {cli.name}  model={model.parent.name}/{model.name}")
+    language = _normalize_language(language, logger)
 
-    model_info = resolve_model(model_query)
-    logger.info(
-        f"Using model: {model_info['name']} ({model_info['model_type']}, {model_info['size_mb']:.0f} MB)"
-    )
-
-    asr_model = load_model(model_info, logger=logger)
-    vad = load_vad()
-
-    if input_path.is_file():
-        return _transcribe_file(asr_model, vad, input_path, language, vad_threshold, logger)
-    elif input_path.is_dir():
-        return _transcribe_directory(
-            asr_model, vad, input_path, language, vad_threshold, overlap_secs, parallel, logger
-        )
-    else:
+    if not input_path.exists():
         raise FileNotFoundError(f"Input not found: {input_path}")
+    if input_path.is_file():
+        return _transcribe_single_file(cli, model, input_path, language, logger)
+    elif input_path.is_dir():
+        return _transcribe_directory(cli, model, input_path, language, overlap_secs, logger)
+    else:
+        raise ValueError(f"Input path is neither a file nor directory: {input_path}")
 
 
-CHUNK_DURATION_MS = 10 * 60 * 1000  # 10 minutes per chunk
-CHUNK_OVERLAP_MS = 5 * 1000  # 5 seconds overlap
-
-
-def _transcribe_file(
-    asr_model,
-    vad,
+def _transcribe_single_file(
+    cli: Path,
+    model: Path,
     file_path: Path,
     language: str | None,
-    vad_threshold: float,
     logger: logging.Logger,
 ) -> list[dict]:
-    """Transcribe a single audio file with VAD.
-
-    For files > 10 minutes, auto-splits into temporary WAV chunks,
-    transcribes each sequentially with correct time offsets, then merges.
-    """
-    logger.info(f"Loading {file_path.name}...")
-    audio = AudioSegment.from_file(str(file_path), format=detect_format(file_path))
-    audio = audio.set_frame_rate(SAMPLE_RATE).set_channels(1)
-    duration_ms = len(audio)
-
-    if duration_ms <= CHUNK_DURATION_MS:
-        return _transcribe_wav_segment(
-            audio, file_path.name, 0.0, asr_model, vad, vad_threshold, language, logger
-        )
-
-    logger.info(
-        f"File is {duration_ms / 1000:.0f}s, splitting into "
-        f"~{duration_ms // CHUNK_DURATION_MS + 1} chunks of {CHUNK_DURATION_MS // 1000}s"
-    )
-
-    all_segments = []
-    chunk_num = 0
-    pos_ms = 0
-
-    while pos_ms < duration_ms:
-        end_ms = min(pos_ms + CHUNK_DURATION_MS, duration_ms)
-        chunk = audio[pos_ms:end_ms]
-        offset_s = pos_ms / 1000.0
-
-        chunk_num += 1
-        logger.info(f"  Transcribing chunk {chunk_num} at {offset_s:.0f}s...")
-
-        segs = _transcribe_wav_segment(
-            chunk,
-            f"{file_path.name}#chunk{chunk_num}",
-            offset_s,
-            asr_model,
-            vad,
-            vad_threshold,
-            language,
-            logger,
-        )
-        all_segments.extend(segs)
-
-        pos_ms += CHUNK_DURATION_MS - CHUNK_OVERLAP_MS
-
-    if not all_segments:
-        return []
-
-    all_segments.sort(key=lambda x: x["start"])
-    return deduplicate_segments(all_segments, overlap_threshold=0.3)
-
-
-def _transcribe_wav_segment(
-    audio: AudioSegment,
-    label: str,
-    time_offset_s: float,
-    asr_model,
-    vad,
-    vad_threshold: float,
-    language: str | None,
-    logger: logging.Logger,
-) -> list[dict]:
-    """Transcribe an in-memory AudioSegment via temp WAV file."""
-    tmp_dir = tempfile.TemporaryDirectory()
-    tmp_path = Path(tmp_dir.name) / "segment.wav"
-
+    """Transcribe a single audio file. Whisper chunks long audio internally."""
+    tmp_dir, wav_path = load_audio_as_wav16k(file_path)
     try:
-        audio.export(str(tmp_path), format="wav")
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as bf:
+            bf.write(str(wav_path))
+            batch_file = Path(bf.name)
+        try:
+            segs_list, _cli_error = _run_cli(cli, model, batch_file, language, logger)
+        finally:
+            batch_file.unlink(missing_ok=True)
 
-        model_with_vad = asr_model.with_vad(
-            vad,
-            threshold=vad_threshold,
-            max_speech_duration_s=30.0,
-            min_silence_duration_ms=300.0,
-        )
-        kwargs = {}
-        if language:
-            kwargs["language"] = language
-
-        segments = []
-        for result in model_with_vad.recognize(str(tmp_path), **kwargs):
-            segments.append(
-                {
-                    "start": result.start + time_offset_s,
-                    "end": result.end + time_offset_s,
-                    "text": result.text,
-                }
-            )
-
-        logger.info(f"    {label}: {len(segments)} segments")
-        return segments
-
+        if not segs_list:
+            return []
+        return _segs_from_jsonl(segs_list[0])
     finally:
         tmp_dir.cleanup()
 
 
 def _transcribe_directory(
-    asr_model,
-    vad,
+    cli: Path,
+    model: Path,
     input_dir: Path,
     language: str | None,
-    vad_threshold: float,
     overlap_secs: float,
-    parallel: int,
     logger: logging.Logger,
 ) -> list[dict]:
-    """Transcribe a directory of audio chunks in parallel with time offsets."""
-    audio_files = sorted(
-        f for f in input_dir.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
-    )
+    """Transcribe a directory of audio chunks with time offsets.
 
+    The CLI loads the model once and transcribes a batch of files. A single
+    pathological chunk (e.g. one exceeding the decoder token cap) aborts the
+    whole CLI process, so we isolate failures: on an aborted batch we accept
+    the chunks that already produced results, retry the failing chunk alone,
+    then continue with the remainder. This guarantees a transcript for every
+    good chunk instead of losing the entire run to one bad chunk.
+    """
+    audio_files = sorted(
+        (f for f in input_dir.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS),
+        key=audio.numeric_sort_key,
+    )
     if not audio_files:
         raise FileNotFoundError(f"No audio files found in: {input_dir}")
+    logger.info(f"Found {len(audio_files)} chunks")
 
-    logger.info(f"Found {len(audio_files)} audio files")
+    # Convert every chunk to 16k mono WAV up front; keep temp dirs alive for
+    # the whole transcription so reused paths stay valid across batches.
+    tmp_dirs = []
+    wav_paths = []
+    try:
+        for f in audio_files:
+            td, wp = load_audio_as_wav16k(f)
+            tmp_dirs.append(td)
+            wav_paths.append(wp)
 
-    model_with_vad = asr_model.with_vad(
-        vad,
-        threshold=vad_threshold,
-        max_speech_duration_s=30.0,
-        min_silence_duration_ms=300.0,
-    )
+        # Map global index -> raw CLI result object (None if not yet produced).
+        raw_by_index: dict[int, dict] = {}
+        pending: list[int] = list(range(len(audio_files)))
+        skipped = 0
+        while pending:
+            sub = [wav_paths[i] for i in pending]
+            with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as bf:
+                for wp in sub:
+                    bf.write(str(wp) + "\n")
+                batch_file = Path(bf.name)
+            try:
+                results, cli_error = _run_cli(cli, model, batch_file, language, logger)
+            except RuntimeError as e:
+                # CLI produced no results at all for this sub-batch (systemic
+                # failure, not an isolated bad chunk). Accept whatever we already
+                # collected and skip the remaining chunks rather than crash.
+                logger.error(f"  transcribe-cli failed hard on a sub-batch: {e}")
+                skipped += len(pending)
+                break
+            finally:
+                batch_file.unlink(missing_ok=True)
 
-    # Calculate cumulative time offsets from chunk durations
+            produced = len(results)
+            for j, obj in enumerate(results):
+                raw_by_index[pending[j]] = obj
+            if cli_error is None:
+                pending.clear()
+                continue
+
+            # CLI aborted partway. Accept everything produced so far; the first
+            # unproduced index is the failing chunk. Retry it alone; if it still
+            # fails, skip it. Then continue with the rest after it.
+            fail_idx = produced  # first pending index with no result
+            if fail_idx < len(pending):
+                bad = pending[fail_idx]
+                logger.warning(
+                    f"  chunk {bad + 1}/{len(audio_files)} ({audio_files[bad].name}) "
+                    f"aborted batch: {cli_error}"
+                )
+                with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as sbf:
+                    sbf.write(str(wav_paths[bad]) + "\n")
+                    single_batch = Path(sbf.name)
+                try:
+                    retry_results, single_err = _run_cli(cli, model, single_batch, language, logger)
+                finally:
+                    single_batch.unlink(missing_ok=True)
+                if single_err is None:
+                    if retry_results:
+                        raw_by_index[bad] = retry_results[0]
+                        logger.info(f"  chunk {bad + 1} recovered on retry")
+                    else:
+                        skipped += 1
+                        logger.error(f"  chunk {bad + 1} retry produced no result; skipping")
+                else:
+                    skipped += 1
+                    logger.error(
+                        f"  skipped chunk {bad + 1}/{len(audio_files)} "
+                        f"({audio_files[bad].name}): {single_err}"
+                    )
+            pending = pending[fail_idx + 1 :]
+
+        if skipped:
+            logger.warning(f"Skipped {skipped} chunk(s) that exceeded the model context cap")
+
+    finally:
+        for td in tmp_dirs:
+            td.cleanup()
+
+    # Calculate cumulative offsets from original chunk durations (pre-conversion)
     offsets = _calculate_chunk_offsets(audio_files, overlap_secs, logger)
     logger.info(f"Chunk offsets: {offsets[:5]}... (first 5)")
 
-    def _transcribe_one(file_path: Path, offset_s: float) -> tuple[str, list[dict]]:
-        tmp_dir, wav_path = _load_audio_as_wav16k(file_path)
-        try:
-            kwargs = {}
-            if language:
-                kwargs["language"] = language
-
-            segments = []
-            for result in model_with_vad.recognize(str(wav_path), **kwargs):
-                segments.append(
-                    {
-                        "start": result.start + offset_s,
-                        "end": result.end + offset_s,
-                        "text": result.text,
-                    }
-                )
-            return file_path.name, segments
-        finally:
-            tmp_dir.cleanup()
-
+    # Build segments from the per-chunk results we collected.
     all_segments = []
-    total = len(audio_files)
-    for i, (file_path, offset_s) in enumerate(zip(audio_files, offsets, strict=True)):
-        logger.info(
-            f"  [{i + 1}/{total}] Transcribing {file_path.name} (offset {offset_s:.0f}s)..."
-        )
-        try:
-            name, segments = _transcribe_one(file_path, offset_s)
-            all_segments.append((name, segments))
-            logger.info(f"  [{i + 1}/{total}] Done: {len(segments)} segments")
-        except Exception as e:
-            logger.error(f"  [{i + 1}/{total}] Failed: {file_path.name}: {e}")
+    all_synthetic = True
+    for i, offset_s in enumerate(offsets):
+        obj = raw_by_index.get(i)
+        if obj is None or "error" in obj:
+            continue
+        segs = _segs_from_jsonl(obj, offset_s)
+        # Models like cohere/granite may return text but no per-word segments.
+        # Create a single synthetic segment spanning the full chunk duration.
+        if not segs and obj.get("text", "").strip():
+            chunk_dur = get_audio_duration(audio_files[i])
+            segs = [{"start": offset_s, "end": offset_s + chunk_dur, "text": obj["text"].strip()}]
+        else:
+            all_synthetic = False
+        all_segments.extend(segs)
+        logger.info(f"  [{i + 1}/{len(audio_files)}] {audio_files[i].name}: {len(segs)} segments")
 
     if not all_segments:
         return []
 
-    all_segments.sort(key=lambda x: x[0])
-    return _merge_chunks(all_segments, overlap_secs)
+    all_segments.sort(key=lambda x: x["start"])
+    # Synthetic segments (text-only models) represent full chunks — they must not
+    # be merged across overlapping chunk boundaries.
+    if all_synthetic:
+        return all_segments
+    return deduplicate_segments(all_segments, overlap_threshold=0.3)
 
 
-def _get_audio_duration(file_path: Path) -> float:
-    """Get audio duration in seconds using ffprobe (no full load into memory)."""
-    import subprocess
+def chunk_step_seconds(chunk_duration_s: float, overlap_s: float) -> float:
+    """Nominal source advance between consecutive chunk starts.
 
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(file_path),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return float(result.stdout.strip())
+    Delegates to the shared helper in src.audio so every engine (local and
+    Groq) computes the timeline step identically.
+    """
+    return audio.chunk_step_seconds(chunk_duration_s, overlap_s)
 
 
 def _calculate_chunk_offsets(
@@ -454,66 +572,15 @@ def _calculate_chunk_offsets(
     overlap_secs: float,
     logger: logging.Logger,
 ) -> list[float]:
-    """Calculate cumulative time offsets for each chunk using ffprobe.
+    """Cumulative start offsets for each chunk in the continuous source timeline.
 
-    Chunk N starts at: sum(duration[0..N-1]) - N * overlap_secs
+    Delegates to the single shared implementation in src.audio.chunk_offsets,
+    which steps by the NOMINAL slice length the splitter used (read from the
+    split sidecar) instead of summing each Opus chunk's ffprobe duration. Each
+    Opus chunk carries a 312-sample pre-skip that ffprobe counts in the stream
+    duration, so summing per-chunk durations drifts the transcript timeline
+    forward of the continuous diarize WAV (which decodes the source once).
+    Over a ~1400-chunk file this reaches ~9s of desync between the displayed
+    timestamp and the audio it seeks to.
     """
-    offsets = []
-    cumulative = 0.0
-
-    for i, f in enumerate(audio_files):
-        offsets.append(max(0.0, cumulative))
-        duration_s = _get_audio_duration(f)
-        cumulative += duration_s - overlap_secs
-        logger.debug(f"  Chunk {i + 1}: offset={offsets[i]:.1f}s, duration={duration_s:.1f}s")
-
-    return offsets
-
-
-def _merge_chunks(
-    chunk_results: list[tuple[str, list[dict]]],
-    overlap_secs: float,
-) -> list[dict]:
-    """Merge transcription results from multiple chunks.
-
-    With proper time offsets applied, segments from different chunks only
-    overlap in the overlap region. Deduplicate by dropping segments that
-    fall entirely within the overlap of the previous chunk.
-    """
-    all_segments = []
-
-    for _chunk_name, segments in chunk_results:
-        for seg in segments:
-            all_segments.append(
-                {
-                    "start": seg["start"],
-                    "end": seg["end"],
-                    "text": seg["text"],
-                }
-            )
-
-    if not all_segments:
-        return []
-
-    all_segments.sort(key=lambda x: x["start"])
-
-    # Drop segments that fall entirely within the previous segment's time range
-    # (these are duplicates from chunk overlap)
-    merged = []
-    for seg in all_segments:
-        if merged and seg["end"] <= merged[-1]["end"]:
-            # Segment is entirely within previous - skip duplicate
-            continue
-        if merged and seg["start"] < merged[-1]["end"]:
-            # Partial overlap - trim the start
-            overlap = merged[-1]["end"] - seg["start"]
-            if overlap < overlap_secs:
-                # Small overlap from chunk boundary - keep both, just trim
-                merged.append(seg)
-            else:
-                # Large overlap - skip
-                continue
-        else:
-            merged.append(seg)
-
-    return merged
+    return audio.chunk_offsets(audio_files, overlap_secs, logger)

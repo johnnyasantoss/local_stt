@@ -30,13 +30,20 @@ def convert_audio(
     cmd = [
         "ffmpeg",
         "-hide_banner",
-        "-loglevel", "warning",
-        "-threads", str(threads) if threads > 0 else str(os.cpu_count() or 1),
-        "-i", str(input_path),
-        "-ar", str(sample_rate),
-        "-ac", str(channels),
-        "-c:a", codec,
-        "-b:a", bitrate,
+        "-loglevel",
+        "warning",
+        "-threads",
+        str(threads) if threads > 0 else str(os.cpu_count() or 1),
+        "-i",
+        str(input_path),
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        str(channels),
+        "-c:a",
+        codec,
+        "-b:a",
+        bitrate,
         "-y",
         str(output_path),
     ]
@@ -48,14 +55,17 @@ def main() -> int:
     add_verbose_arg(parser)
     parser.add_argument("-i", "--input", type=Path, required=True, help="Input audio file")
     parser.add_argument("-o", "--output", type=Path, help="Output file")
-    parser.add_argument("--sample-rate", type=int, default=16000, help="Target sample rate (default: 16000)")
-    parser.add_argument("--channels", type=int, default=1, help="Target channels (default: 1 = mono)")
+    parser.add_argument(
+        "--sample-rate", type=int, default=16000, help="Target sample rate (default: 16000)"
+    )
+    parser.add_argument(
+        "--channels", type=int, default=1, help="Target channels (default: 1 = mono)"
+    )
     parser.add_argument("--format", default="ogg", help="Output format (default: ogg)")
     parser.add_argument("--codec", default="libopus", help="Audio codec (default: libopus)")
     parser.add_argument("--bitrate", default="128000", help="Bitrate (default: 128000)")
     parser.add_argument(
-        "-j", "--threads", type=int, default=0,
-        help="Number of threads (0 = all cores, default: 0)"
+        "-j", "--threads", type=int, default=0, help="Number of threads (0 = all cores, default: 0)"
     )
 
     args = parser.parse_args()
@@ -67,12 +77,16 @@ def main() -> int:
 
         audio = load_audio(input_path)
         info = get_audio_info(audio)
-        logger.info(f"Audio: {info['duration_seconds']:.1f}s, {info['channels']}ch, {info['sample_rate']}Hz")
+        logger.info(
+            f"Audio: {info['duration_seconds']:.1f}s, {info['channels']}ch, {info['sample_rate']}Hz"
+        )
 
         output_path = resolve_output_path(args.output, input_path, args.format)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"Converting to {args.sample_rate}Hz, {args.channels}ch, {args.codec} (threads: {args.threads or 'all'})...")
+        logger.info(
+            f"Converting to {args.sample_rate}Hz, {args.channels}ch, {args.codec} (threads: {args.threads or 'all'})..."
+        )
         convert_audio(
             input_path,
             output_path,

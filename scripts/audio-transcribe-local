@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Transcribe audio files locally using ONNX models from Handy.app."""
+"""Transcribe audio files locally using transcribe.cpp (Handy Computer's ggml STT engine).
+
+transcribe.cpp is the new Handy Computer release that replaces the previous
+ONNX transcription path. It runs GGUF models on Metal/Vulkan/CUDA/CPU and is
+substantially faster than ONNX on the same hardware.
+"""
 
 import sys
 from pathlib import Path
@@ -8,13 +13,97 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
 
+from src.audio import numeric_sort_key
 from src.local_transcribe import discover_models, transcribe_local
 from src.logging import add_verbose_arg, setup_logging
-from src.srt import segments_to_srt, parse_srt
+from src.srt import parse_srt, segments_to_srt
 
 load_dotenv()
 
 AUDIO_EXTENSIONS = [".ogg", ".opus", ".wav", ".m4a", ".mp3", ".flac", ".webm"]
+
+
+def _correct_srt_offsets_for_opus_preskip(segments: list[dict], sidecar: Path) -> list[dict]:
+    """Re-map cached-SRT segment times onto the correct chunk grid.
+
+    Two generations of SRT exist: ones written by the buggy offset math
+    (which summed each Opus chunk's ffprobe duration, including the per-chunk
+    312-sample / 6.5ms pre-skip, drifting the timeline forward by ~k*pre_skip
+    over a long file) and ones written after the fix (already on the nominal
+    chunk grid). We decide which from the SRT's overall span rather than
+    per-segment, because a drifted segment near a chunk start can otherwise
+    masquerade as already-correct: the implied per-chunk step
+    (last_start / (num_chunks-1)) matches either the correct grid (step) or
+    the drifted grid (step+pre_skip). If it matches the correct grid the SRT
+    is left untouched (re-running on an already-fixed SRT is a no-op); if it
+    matches the drifted grid the pre-skip drift is subtracted from every
+    segment. Returns segments unchanged if the sidecar/chunks are missing.
+    """
+    if not sidecar.is_file():
+        return segments
+    try:
+        import json
+
+        meta = json.loads(sidecar.read_text(encoding="utf-8"))
+        size_mb = float(meta["size_mb"])
+        bitrate = int(meta["bitrate"])
+        max_seconds = meta.get("max_seconds")
+        overlap = float(meta.get("overlap", 0))
+    except (KeyError, ValueError, json.JSONDecodeError):
+        return segments
+
+    chunk_s = int(size_mb * 1024 * 1024 * 8 / bitrate)
+    if max_seconds is not None:
+        chunk_s = int(min(chunk_s, float(max_seconds)))
+    step = max(0.0, chunk_s - overlap)
+    if step <= 0:
+        return segments
+
+    # Measure the real per-chunk pre-skip from one chunk if available.
+    preskip_s = 0.0
+    chunk_dir = sidecar.parent
+    chunks = sorted(
+        (p for p in chunk_dir.glob("*.ogg") if p.is_file()),
+        key=numeric_sort_key,
+    )
+    if chunks:
+        from src.audio import get_audio_duration
+
+        try:
+            real_dur = get_audio_duration(chunks[0])
+            preskip_s = max(0.0, real_dur - chunk_s)
+        except Exception:
+            preskip_s = 0.0
+    if preskip_s <= 0:
+        return segments
+
+    if len(chunks) < 2 or not segments:
+        return segments
+    last_start = max(seg.get("start", 0.0) for seg in segments)
+    if last_start <= 0:
+        return segments
+    # Discriminate the two grids using a mid-file reference segment, where the
+    # cumulative drift (k*pre_skip) is large and unambiguous. A partial final
+    # chunk would otherwise blur the global span between the 13.0 (correct) and
+    # 13.0065 (drifted) steps.
+    ref = min(segments, key=lambda s: abs(s.get("start", 0.0) - 0.5 * last_start))
+    ref_start = ref.get("start", 0.0)
+    k_ref = int(ref_start / step + 0.5)
+    drift = ref_start - k_ref * step
+    tol = preskip_s * 3.0
+    if abs(drift) <= tol:
+        return segments  # already on the correct grid; no-op
+    if abs(drift - k_ref * preskip_s) > tol:
+        return segments  # neither grid matches; leave untouched
+
+    # Drifted grid: subtract k*pre_skip from each segment (k = its chunk index).
+    for seg in segments:
+        start = seg.get("start", 0.0)
+        k = int(start / (step + preskip_s) + 0.5)
+        shift = k * preskip_s
+        seg["start"] = max(0.0, start - shift)
+        seg["end"] = max(seg["start"], seg["end"] - shift)
+    return segments
 
 
 def _find_full_audio(input_path: Path) -> Path:
@@ -42,55 +131,100 @@ def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Transcribe audio locally using ONNX models from Handy.app"
+        description="Transcribe audio locally using transcribe.cpp (Handy Computer ggml STT)"
     )
     add_verbose_arg(parser)
-    parser.add_argument("-i", "--input", type=Path, required=True,
-                        help="Input audio file or directory of chunks")
-    parser.add_argument("-o", "--output", type=Path, required=True,
-                        help="Output .srt file")
-    parser.add_argument("-m", "--model", default=None,
-                        help="Model name or path (fuzzy matched). "
-                             "If omitted, lists available models.")
-    parser.add_argument("-l", "--language",
-                        help="Language code (e.g., en). Required for Canary.")
-    parser.add_argument("--vad-threshold", type=float, default=0.5,
-                        help="VAD speech detection threshold (default: 0.5)")
-    parser.add_argument("--overlap-secs", type=float, default=5.0,
-                        help="Overlap seconds for chunk merging (default: 5)")
-    parser.add_argument("-j", "--parallel", type=int, default=4,
-                        help="Parallel workers for chunk directory (default: 4)")
-    parser.add_argument("--diarize", action="store_true",
-                        help="Run speaker diarization and label speakers")
-    parser.add_argument("--num-speakers", type=int, default=None,
-                        help="Known number of speakers (optional)")
-    parser.add_argument("--speakers-file", type=Path, default=None,
-                        help="Path to .speakers.json mapping (skip interactive prompt)")
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="List available handy-computer GGUF models and exit",
+    )
+    pre, _ = parser.parse_known_args()
+    list_only = getattr(pre, "list_models", False)
 
+    parser.add_argument(
+        "-i",
+        "--input",
+        type=Path,
+        required=not list_only,
+        help="Input audio file or directory of chunks",
+    )
+    parser.add_argument(
+        "-o", "--output", type=Path, required=not list_only, help="Output .srt file"
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        help="GGUF model path or HF cache short name. Required (no default model).",
+    )
+    parser.add_argument(
+        "-l",
+        "--language",
+        help="ISO 639-1 two-letter code (e.g., en, pt). Regional variants like pt-BR are not accepted; use the base code. None = auto-detect.",
+    )
+    parser.add_argument(
+        "--overlap-secs",
+        type=float,
+        default=2.0,
+        help=(
+            "Overlap seconds used when splitting (default: 2). Lower overlap "
+            "duplicates less audio per boundary, reducing transcription cost; "
+            "2s preserves word boundaries for 15-65s model windows."
+        ),
+    )
+    parser.add_argument(
+        "-j",
+        "--parallel",
+        type=int,
+        default=4,
+        help="Parallel workers for chunk directory (default: 4)",
+    )
+    parser.add_argument(
+        "--diarize", action="store_true", help="Run speaker diarization and label speakers"
+    )
+    parser.add_argument(
+        "--num-speakers", type=int, default=None, help="Known number of speakers (optional)"
+    )
+    parser.add_argument(
+        "--speakers-file",
+        type=Path,
+        default=None,
+        help="Path to .speakers.json mapping (skip interactive prompt)",
+    )
     args = parser.parse_args()
     logger = setup_logging(args.v)
 
-    if args.model is None:
+    if args.list_models:
         models = discover_models()
         if not models:
-            logger.error("No supported models found in Handy models directory")
+            logger.error(
+                "No GGUF models found in HuggingFace cache "
+                "(~/.cache/huggingface/hub/models--handy-computer--*-gguf)."
+            )
             return 1
-        print("Available models:")
+        print("Available handy-computer GGUF models:")
         for m in models:
-            print(f"  {m['name']:30s}  {m['model_type']:25s}  {m['size_mb']:.0f} MB")
+            print(f"  {m['name']:30s}  {m['quant']:8s}  {m['size_mb']:.0f} MB")
         return 0
 
     try:
         if args.output.exists() and args.output.stat().st_size > 0:
             logger.info(f"Loading existing transcription: {args.output}")
             segments = parse_srt(args.output.read_text(encoding="utf-8"))
+            # Re-align cached segment times to the continuous-WAV timeline if a
+            # split sidecar is present (corrects Opus pre-skip drift baked into
+            # SRTs written before the offset fix).
+            if args.input.is_dir():
+                sidecar = args.input / ".split-meta.json"
+            else:
+                sidecar = args.input.parent / "chunks" / ".split-meta.json"
+            segments = _correct_srt_offsets_for_opus_preskip(segments, sidecar)
             logger.info(f"Loaded {len(segments)} segments from SRT")
         else:
             segments = transcribe_local(
                 input_path=args.input,
                 model_query=args.model,
                 language=args.language,
-                vad_threshold=args.vad_threshold,
                 overlap_secs=args.overlap_secs,
                 parallel=args.parallel,
                 logger=logger,
@@ -102,14 +236,8 @@ def main() -> int:
             import json
             import sys as _sys
 
-            if not _sys.stdin.isatty():
-                logger.error(
-                    "Diarization requires an interactive terminal for speaker labeling. "
-                    "Run directly in your terminal (not piped or backgrounded)."
-                )
-                return 1
-
             from src.diarize import (
+                _ensure_wav,
                 apply_speaker_labels,
                 assign_speakers_to_segments,
                 diarize_audio,
@@ -139,9 +267,7 @@ def main() -> int:
             diar_cache_path = args.output.with_suffix(".diarization.json")
             if diar_cache_path.exists():
                 logger.info(f"Loading cached diarization: {diar_cache_path}")
-                diarization_segments = json.loads(
-                    diar_cache_path.read_text(encoding="utf-8")
-                )
+                diarization_segments = json.loads(diar_cache_path.read_text(encoding="utf-8"))
                 logger.info(f"Loaded {len(diarization_segments)} diarization segments")
             else:
                 diarization_segments = diarize_audio(
@@ -160,19 +286,28 @@ def main() -> int:
 
             if speaker_finalized:
                 logger.info("Using finalized speaker labels (skipping prompt)")
-            else:
+            elif _sys.stdin.isatty():
                 # Prompt for speaker labels (shows saved labels as defaults)
-                samples, counts = get_speaker_samples(segments)
+                samples, _ = get_speaker_samples(segments)
+                # Locate the cached diarize WAV for audio playback (or skip if unavailable).
+                full_audio = _find_full_audio(args.input)
+                _, wav_path = _ensure_wav(full_audio, cache_dir=args.output.parent)
                 speaker_labels, speaker_finalized = prompt_speaker_labels(
-                    samples, counts, existing_labels=speaker_labels
+                    samples, diarization_segments, wav_path=wav_path, existing_labels=speaker_labels
+                )
+            else:
+                logger.warning(
+                    "Not a TTY; skipping interactive speaker labeling. "
+                    "Segments keep default SPEAKER_N labels (re-run in a terminal to name them)."
                 )
 
             sp_path = args.output.with_suffix(".speakers.json")
-            save_speaker_mapping(speaker_labels, sp_path, finalized=speaker_finalized)
+            save_speaker_mapping(speaker_labels or {}, sp_path, finalized=speaker_finalized)
             logger.info(f"Saved speaker mapping to {sp_path}")
 
-            segments = apply_speaker_labels(segments, speaker_labels)
+            segments = apply_speaker_labels(segments, speaker_labels or {})
             include_speakers = True
+            srt_content = segments_to_srt(segments, include_speakers=include_speakers)
 
         srt_content = segments_to_srt(segments, include_speakers=include_speakers)
 

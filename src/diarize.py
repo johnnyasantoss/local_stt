@@ -2,12 +2,19 @@
 
 import json
 import os
-import random
+import shutil
 import subprocess
 import tempfile
+import typing as _typing
 from pathlib import Path
 
 import torch
+
+
+class _HasItertracks(_typing.Protocol):
+    """Protocol for pyannote Annotation types with itertracks method."""
+
+    def itertracks(self, yield_label: bool) -> _typing.Iterator[tuple]: ...
 
 
 def _ensure_wav(
@@ -122,19 +129,35 @@ def diarize_audio(
         elif cache_dir is not None and logger and wav_path.exists():
             logger.info(f"Using cached WAV: {wav_path}")
 
-        result = pipeline(str(wav_path), **kwargs)
-
-        # pyannote 4.x returns DiarizeOutput, older versions return Annotation directly
+        # Build kwargs explicitly so pyright can narrow the types (avoids int/float vs bool mismatch).
+        _pipeline_kwargs: dict = {}
+        if kwargs.get("num_speakers") is not None:
+            _pipeline_kwargs["num_speakers"] = kwargs["num_speakers"]
+        elif kwargs.get("min_speakers") is not None:
+            _pipeline_kwargs["min_speakers"] = kwargs["min_speakers"]
+            _pipeline_kwargs["max_speakers"] = kwargs["max_speakers"]
+        result = pipeline(str(wav_path), **_pipeline_kwargs)  # type: ignore[arg-type]
         if hasattr(result, "speaker_diarization"):
-            annotation = result.speaker_diarization
+            annotation = result.speaker_diarization  # type: ignore[union-attr]
         else:
             annotation = result
+            assert hasattr(annotation, "itertracks"), (
+                "Expected pyannote Annotation or DiarizationOutput"
+            )
     finally:
         if tmp_dir is not None:
             tmp_dir.cleanup()
 
     segments = []
-    for turn, _, speaker in annotation.itertracks(yield_label=True):
+    # Guard against pyannote versions that do not expose itertracks (e.g. DiarizationOutput).
+    if hasattr(annotation, "itertracks"):
+        # Use cast to avoid pyright/ty errors from hasattr narrowing.
+        _annotation = _typing.cast(_HasItertracks, annotation)
+        it = _annotation.itertracks(yield_label=True)
+    else:
+        it = []
+
+    for turn, _, speaker in it:
         segments.append(
             {
                 "start": turn.start,
@@ -178,13 +201,13 @@ def assign_speakers_to_segments(
 
 def get_speaker_samples(
     segments: list[dict],
-    max_samples: int = 3,
 ) -> tuple[dict[str, list[dict]], dict[str, int]]:
-    """Group segments by speaker, return the best samples for labeling.
+    """Group transcription segments by speaker, returning all samples for labeling.
 
-    Prefers long, substantive segments (>=2s duration, >=10 chars text)
-    so the user can clearly hear and identify each speaker's voice.
-    Falls back to shorter segments if not enough long ones exist.
+    For each speaker, returns every segment sorted by start time ascending so
+    the TUI can page through them from the start of the recording (avoids
+    seeking back through a long file). Substantive segments (>=2s, >=10 chars)
+    come first, then shorter ones, both by earliest start.
 
     Returns (samples_by_speaker, segment_counts).
     """
@@ -206,20 +229,13 @@ def get_speaker_samples(
 
     picked: dict[str, list[dict]] = {}
     for speaker, segs in all_segs.items():
-        # Prefer long segments with substantive text
         substantive = [
             s for s in segs if (s["end"] - s["start"]) >= 2.0 and len(s["text"].strip()) >= 10
         ]
-        # Sort by duration descending — longest segments are clearest for ID
-        substantive.sort(key=lambda s: s["end"] - s["start"], reverse=True)
-
-        if len(substantive) >= max_samples:
-            picked[speaker] = substantive[:max_samples]
-        else:
-            # Use all substantive, fill remaining with shorter ones
-            remaining = [s for s in segs if s not in substantive]
-            remaining.sort(key=lambda s: s["end"] - s["start"], reverse=True)
-            picked[speaker] = (substantive + remaining)[:max_samples]
+        substantive.sort(key=lambda s: s["start"])
+        remaining = [s for s in segs if s not in substantive]
+        remaining.sort(key=lambda s: s["start"])
+        picked[speaker] = substantive + remaining
 
     return picked, dict(counts)
 
@@ -232,15 +248,83 @@ def _format_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+_SPEAKER_HELP = """\
+  Speaker labeling commands
+    1,2,3     play snippet 1-3 on the current page
+    h         replay the last played snippet
+    /more     show the next 3 samples for this speaker
+    /help     show this help
+    <name>    assign the label and move to the next speaker
+    <Enter>   keep the shown default (if any)
+  Press Ctrl+C at any time to save partial labels and exit."""
+
+
+def _play_audio_snippet(wav_path: Path, start_s: float, duration_s: float = 5.0) -> None:
+    """Play a short audio snippet from *wav_path* starting at *start_s*.
+
+    Uses ``ffplay`` (ships with ffmpeg, already a project dependency) which
+    seeks accurately via ``-ss``/``-t``. The macOS ``afplay`` binary cannot
+    seek (no -start/-length flags) so it is intentionally not used. Silently
+    skips if ffplay is unavailable — the user can still label without audio.
+    """
+    duration_s = max(2.0, min(duration_s, 8.0))
+    ffplay = shutil.which("ffplay")
+
+    if ffplay is None:
+        return
+    try:
+        subprocess.run(
+            [
+                ffplay,
+                "-nodisp",
+                "-loglevel",
+                "quiet",
+                "-ss",
+                str(start_s),
+                "-t",
+                str(duration_s),
+                str(wav_path),
+            ],
+            check=True,
+            timeout=duration_s + 2,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+
+def _speaker_diarization_segments(
+    speaker_id: str,
+    diarization_segments: list[dict],
+    limit: int = 15,
+    min_duration_s: float = 0.5,
+) -> list[dict]:
+    """Return up to *limit* contiguous diarization segments for one speaker with duration >= *min_duration_s*."""
+    out: list[dict] = []
+    for s in diarization_segments:
+        if s["speaker"] != speaker_id:
+            continue
+        dur = s["end"] - s["start"]
+        if dur < min_duration_s:
+            continue
+        out.append(s)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def prompt_speaker_labels(
-    samples: dict[str, list[dict]],
-    counts: dict[str, int],
+    samples_by_transcription: dict[str, list[dict]],
+    diarization_segments: list[dict],
+    wav_path: Path | None = None,
     existing_labels: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], bool]:
     """Interactive CLI prompt for labeling speakers.
 
-    Shows sample text with timestamps so the user can navigate to that
-    point in the audio to hear the speaker's voice.
+    Shows every pyannote-detected speaker — including those whose time ranges
+    did not overlap any transcription segment (e.g. when transcribe-cli emits
+    one long segment). For each speaker: display up to three short audio snippets
+    from their diarization segments and accept a name label, with an optional
+    "h" key to replay the last sample.
 
     If existing_labels is provided, shows the saved label as default
     (press Enter to keep it). Re-asks all speakers each run so the user
@@ -251,47 +335,136 @@ def prompt_speaker_labels(
     """
     import re
 
-    labels = {}
+    labels: dict[str, str] = {}
     finalized = True
     prev = existing_labels or {}
 
-    all_speakers = sorted(samples.keys())
-    if not all_speakers:
+    # Merge speaker IDs from transcription samples and diarization segments so no
+    # pyannote-detected voice is silently dropped when transcribe-cli outputs few
+    # segments.
+    all_speakers: set[str] = set(samples_by_transcription.keys())
+    for dseg in diarization_segments:
+        all_speakers.add(dseg["speaker"])
+    sorted_ids = sorted(all_speakers)
+    if not sorted_ids:
         return labels, finalized
 
-    print(f"\n  {len(all_speakers)} speaker(s) found.\n")
-    print("  For each speaker, listen to the audio at the timestamp below,")
-    print("  then enter the speaker's name (or press Enter to keep the default).\n")
+    print(f"\n  {len(sorted_ids)} speaker(s) found.\n")
+    print("  For each speaker: press [1-3] to play a snippet, 'h' to replay the last,")
+    print("  '/more' for the next 3 samples, or type a name and press Enter.")
     print("  Ctrl+C to save partial labels and exit.\n")
 
-    try:
-        for speaker_id in all_speakers:
-            segs = samples[speaker_id]
-            count = counts[speaker_id]
-            default = prev.get(speaker_id, "")
+    page_size = 3
 
-            print(f"  {speaker_id} ({count} segments)")
-            for seg in segs:
-                ts = _format_timestamp(seg["start"])
-                # Strip any leftover speaker prefix from cached SRT text
-                text = seg["text"]
-                text = re.sub(r"^\[.+?\]:\s*", "", text)
-                preview = text[:80] + ("..." if len(text) > 80 else "")
-                print(f'    [{ts}] "{preview}"')
-
-            if default:
-                prompt = f"  Enter name for {speaker_id} [{default}]: "
+    def _show_page(pool: list[dict], page: int) -> None:
+        start_off = page * page_size
+        batch = pool[start_off : start_off + page_size]
+        if not batch:
+            print("    (no more samples)")
+            return
+        for i, seg in enumerate(batch, start=1):
+            ts = _format_timestamp(seg["start"])
+            text = re.sub(r"^\[.+?\]:\s*", "", seg.get("text", ""))
+            if text:
+                preview = (text or "<silence>")[:80] + ("..." if len(text) > 80 else "")
+                print(f'    {i}. [{ts}] "{preview}"')
             else:
-                prompt = f"  Enter name for {speaker_id}: "
-            label = input(prompt).strip()
-            labels[speaker_id] = label if label else (default or speaker_id)
-            print()
+                dur = max(2.0, min(seg["end"] - seg["start"], 5.0))
+                print(f"    {i}. [{ts}] (~{dur:.1f}s, no transcript)")
 
+    try:
+        for speaker_id in sorted_ids:
+            default = prev.get(speaker_id, "")
+            count = sum(1 for s in diarization_segments if s["speaker"] == speaker_id)
+            print(f"  {speaker_id} ({count} diarization segments)")
+
+            # Sample pool: transcription segments first (text preview shown), then
+            # that speaker's diarization-only segments as extra listening clips for
+            # /more. Both are sorted earliest-first so labeling stays near the start.
+            trans_segs: list[dict] = samples_by_transcription.get(speaker_id, [])
+            dsegs = _speaker_diarization_segments(speaker_id, diarization_segments)
+            pool: list[dict] = list(trans_segs)
+            for d in dsegs:
+                if d not in pool:
+                    pool.append(d)
+
+            page = 0
+            last_played: float | None = None
+            _show_page(pool, page)
+            prompt = (
+                f"  Enter name for {speaker_id} [{default or 'Speaker'}] "
+                f"(1-3 play, h replay, /more, /help): "
+            )
+            while True:
+                try:
+                    reply = input(prompt).strip()
+                except EOFError:
+                    return labels, False
+                if reply == "" and default:
+                    # Enter keeps the saved label and advances — but never locks
+                    # in the placeholder "SPEAKER_XX" ids pyannote emits (also
+                    # what the interrupt path saves for unlabeled speakers).
+                    if re.fullmatch(r"SPEAKER_\d+", default):
+                        prompt = f"  Enter name for {speaker_id}: "
+                        continue
+                    labels[speaker_id] = default
+                    break
+                if reply in ("/help", "?"):
+                    print(_SPEAKER_HELP)
+                    continue
+                if reply in ("/more", "m", "M"):
+                    if (page + 1) * page_size < len(pool):
+                        page += 1
+                        _show_page(pool, page)
+                    else:
+                        print("    no more samples")
+                    prompt = (
+                        f"  Enter name for {speaker_id} [{default or 'Speaker'}] "
+                        f"(1-3 play, h replay, /more): "
+                    )
+                    continue
+                if reply == "h":
+                    target = (
+                        last_played
+                        if last_played is not None
+                        else (pool[0]["start"] if pool else None)
+                    )
+                    if wav_path is not None and target is not None and wav_path.is_file():
+                        _play_audio_snippet(wav_path, target)
+                        last_played = target
+                    prompt = (
+                        f"  Enter name for {speaker_id} [{default or 'Speaker'}] "
+                        f"(1-3 play, h replay, /more): "
+                    )
+                    continue
+                if reply in ("1", "2", "3"):
+                    idx = int(reply) - 1
+                    start_off = page * page_size
+                    batch = pool[start_off : start_off + page_size]
+                    if 0 <= idx < len(batch):
+                        seg = batch[idx]
+                        dur = max(2.0, min(seg["end"] - seg["start"], 5.0))
+                        if wav_path is not None and wav_path.is_file():
+                            _play_audio_snippet(wav_path, seg["start"], dur)
+                            last_played = seg["start"]
+                    else:
+                        print("    no such snippet on this page")
+                    prompt = (
+                        f"  Enter name for {speaker_id} [{default or 'Speaker'}] "
+                        f"(1-3 play, h replay, /more): "
+                    )
+                    continue
+                if reply:
+                    labels[speaker_id] = reply
+                    break
+                # Empty reply with no default — ask again.
+                prompt = f"  Enter name for {speaker_id}: "
+
+            print()
     except KeyboardInterrupt:
         finalized = False
         print("\n  Interrupted. Saving partial labels...")
-        # Merge: keep any not-yet-asked speakers from previous labels
-        for speaker_id in all_speakers:
+        for speaker_id in sorted_ids:
             if speaker_id not in labels:
                 labels[speaker_id] = prev.get(speaker_id, speaker_id)
 
